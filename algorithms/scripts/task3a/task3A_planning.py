@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Plan and publish the three Task 2B routes from the live occupancy grid."""
+"""Plan and publish the three Task 3A eBot legs and run the eBot side of the handover."""
 
 # Team ID:          [6131]
 # Author List:      [Agrim Chauhan, Saksham Kaushal, Rayhan Khan, Manan Sood]
-# Filename:         task2B_planning.py
-# Task:             2B - StrataCobot (eYRC 2026-27)
+# Filename:         task3A_planning.py
+# Task:             3A - StrataCobot (eYRC 2026-27)
 # Functions:
 #                   _wrap_angle, _quaternion_yaw, __init__, mapcb, odomcb, world_to_grid_float,
 #                   world_to_cell, grid_to_world, _relaxed_endpoint_cells, _make_free_mask,
@@ -12,11 +12,12 @@
 #                   _line_is_free, clear, endpoint_clear, _smooth_cells, _optimize_path_anchors,
 #                   improve_anchor, _append_if_distinct, _tighten_path, _resample_path, plan_path,
 #                   publish_path, _is_stopped, _near_pose, _at_start_and_stopped,
-#                   _request_ore_package, _advance_step, process_planning, main
+#                   _request_ore_package, clearedcb, _announce_at_arm, _advance_step,
+#                   process_planning, main
 # Nodes:
 #                   Name - [ ebot_planner_node ]
-#                   Publishing Topics - [ /ebot_path ]
-#                   Subscribing Topics - [ /map, /odom, /clock ]
+#                   Publishing Topics - [ /ebot_path, /ebot_at_arm ]
+#                   Subscribing Topics - [ /map, /odom, /package_cleared, /clock ]
 #                   Service Clients - [ /spawn_ore_package ]
 
 ################### IMPORT MODULES #######################
@@ -37,6 +38,7 @@ from rclpy.qos import (
     QoSReliabilityPolicy,
 )
 from scipy.ndimage import distance_transform_edt, maximum_filter1d
+from std_msgs.msg import Bool
 from std_srvs.srv import Trigger
 
 
@@ -44,11 +46,19 @@ MAP_TOPIC = '/map'
 PATH_TOPIC = '/ebot_path'
 ODOM_TOPIC = '/odom'
 SPAWN_SERVICE = '/spawn_ore_package'
+# Handover with task3A_manipulation.py (our own interface, both latched):
+#   /ebot_at_arm      True while the eBot is parked beside the arm with the package
+#   /package_cleared  True once the arm has lifted the package off the deck
+AT_ARM_TOPIC = '/ebot_at_arm'
+CLEARED_TOPIC = '/package_cleared'
 MAP_FRAME = 'map'
 
 HOME_POSE = (0.0, 0.0, 0.0)
 ORE_DROP_POSE = (6.0, 1.9, 0.0)
+# Stop pose beside the arm (our choice). The arm base is at (-0.597, 1.865) in
+# world, so the deck centre sits about 0.6 m in front of it: inside UR7e reach.
 ARM_POSE = (0.0, 1.9, math.pi)
+LEG_TO_ARM = 1  # index in STEPS of the ore drop -> arm leg
 STEPS = (
     (HOME_POSE, ORE_DROP_POSE),
     (ORE_DROP_POSE, ARM_POSE),
@@ -81,7 +91,7 @@ class EbotPlanner(Node):
 
     def __init__(self):
         super().__init__(
-            'ebot_planner_node',
+            'task3a_planner',
             parameter_overrides=[rclpy.parameter.Parameter(
                 'use_sim_time', rclpy.Parameter.Type.BOOL, True)],
         )
@@ -97,6 +107,9 @@ class EbotPlanner(Node):
         self.odom_sub = self.create_subscription(
             Odometry, ODOM_TOPIC, self.odomcb, 10)
         self.path_pub = self.create_publisher(Path, PATH_TOPIC, latched_qos)
+        self.at_arm_pub = self.create_publisher(Bool, AT_ARM_TOPIC, latched_qos)
+        self.cleared_sub = self.create_subscription(
+            Bool, CLEARED_TOPIC, self.clearedcb, latched_qos)
         self.spawn_client = self.create_client(Trigger, SPAWN_SERVICE)
 
         self.grid = None
@@ -117,9 +130,14 @@ class EbotPlanner(Node):
         self.spawn_retry_at = 0.0
         self.spawn_deadline = 0.0
         self.spawn_logged = False
+        self.spawn_last_message = None
+
+        self.package_cleared = False
+        self.at_arm_announced = False
+        self.run_complete_logged = False
 
         self.create_timer(0.1, self.process_planning)
-        self.get_logger().info('Task 2B planner ready; waiting for /map and /odom.')
+        self.get_logger().info('Task 3A planner ready; waiting for /map and /odom.')
 
     def mapcb(self, data):
         if self.grid is not None:
@@ -778,6 +796,12 @@ class EbotPlanner(Node):
         )
 
     def _request_ore_package(self):
+        """Call /spawn_ore_package until it succeeds. Returns True once it has.
+
+        Leg 2 is worthless without the package on the deck, so a refusal is
+        retried rather than skipped. The arena answers with its reason
+        (not on the pose, not standing still, package already on board).
+        """
         now = self.get_clock().now().nanoseconds / 1e9
 
         if self.spawn_future is not None:
@@ -790,15 +814,13 @@ class EbotPlanner(Node):
                         self.get_logger().info(
                             f'Ore package request succeeded: {response.message}')
                         return True
-                    self.get_logger().warning(
-                        f'Ore package request failed: {response.message}')
+                    if response.message != self.spawn_last_message:
+                        self.get_logger().warning(
+                            f'Ore package request refused (attempt '
+                            f'{self.spawn_attempts}): {response.message}')
+                        self.spawn_last_message = response.message
                 except Exception as exc:
                     self.get_logger().warning(f'Ore package service error: {exc}')
-
-                if self.spawn_attempts >= 6:
-                    self.get_logger().error(
-                        'Ore package was not spawned after six attempts; continuing the lap.')
-                    return True
                 self.spawn_retry_at = now + 0.5
             elif now >= self.spawn_deadline:
                 self.get_logger().warning('Ore package service timed out; retrying.')
@@ -807,8 +829,6 @@ class EbotPlanner(Node):
             else:
                 return False
 
-        if self.spawn_attempts >= 6:
-            return True
         if now < self.spawn_retry_at or not self.spawn_client.service_is_ready():
             return False
 
@@ -820,18 +840,35 @@ class EbotPlanner(Node):
             self.spawn_logged = True
         return False
 
+    def clearedcb(self, data):
+        if data.data and not self.package_cleared:
+            self.get_logger().info('Arm reports the package is off the deck.')
+        self.package_cleared = bool(data.data)
+
+    def _announce_at_arm(self, value):
+        msg = Bool()
+        msg.data = bool(value)
+        self.at_arm_pub.publish(msg)
+        self.at_arm_announced = bool(value)
+        self.get_logger().info(
+            'Parked beside the arm; waiting for the package to be lifted.'
+            if value else 'Leaving the arm.')
+
     def _advance_step(self):
         completed = self.step + 1
         self.step += 1
         self.path_published = False
         self.path_error_reported = False
         self.end_stable_count = 0
-        self.get_logger().info(f'Task 2B step {completed} complete.')
+        self.get_logger().info(f'Task 3A step {completed} complete.')
 
     def process_planning(self):
         if self.grid is None or self.clearance is None or self.odom is None:
             return
         if self.step >= len(STEPS):
+            if not self.run_complete_logged:
+                self.get_logger().info('eBot is home; all three legs done.')
+                self.run_complete_logged = True
             return
 
         start, end = STEPS[self.step]
@@ -878,6 +915,14 @@ class EbotPlanner(Node):
 
         if self.step == 0 and not self._request_ore_package():
             return
+
+        if self.step == LEG_TO_ARM:
+            # Hold here until the arm has the package off the deck.
+            if not self.at_arm_announced:
+                self._announce_at_arm(True)
+            if not self.package_cleared:
+                return
+            self._announce_at_arm(False)
 
         self._advance_step()
 

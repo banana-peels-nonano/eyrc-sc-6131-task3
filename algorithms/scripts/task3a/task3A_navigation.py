@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Follow successive Task 2B paths using odometry and publish /cmd_vel."""
+"""Follow successive Task 3A eBot paths using odometry and publish /cmd_vel."""
 
 # Team ID:          [6131]
 # Author List:      [Agrim Chauhan, Saksham Kaushal, Rayhan Khan, Manan Sood]
-# Filename:         task2B_navigation.py
-# Task:             2B - StrataCobot (eYRC 2026-27)
+# Filename:         task3A_navigation.py
+# Task:             3A - StrataCobot (eYRC 2026-27)
 # Functions:
 #                   _wrap_angle, _quaternion_yaw, _clamp, __init__, pathcb, odomcb,
 #                   _publish_velocity, _lookahead_target, stop_rover, process_navigation, main
 # Nodes:
-#                   Name - [ ebot_nav_node ]
+#                   Name - [ task3a_navigation ]
 #                   Publishing Topics - [ /cmd_vel ]
 #                   Subscribing Topics - [ /ebot_path, /odom, /clock ]
 
@@ -68,7 +68,7 @@ class EbotNavigation(Node):
 
     def __init__(self):
         super().__init__(
-            'ebot_nav_node',
+            'task3a_navigation',
             parameter_overrides=[rclpy.parameter.Parameter(
                 'use_sim_time', rclpy.Parameter.Type.BOOL, True)],
         )
@@ -95,7 +95,7 @@ class EbotNavigation(Node):
         self.turn_direction = 0
 
         self.create_timer(0.05, self.process_navigation)
-        self.get_logger().info('Task 2B navigation ready; waiting for /ebot_path.')
+        self.get_logger().info('Task 3A navigation ready; waiting for /ebot_path.')
 
     def pathcb(self, data):
         if data.header.frame_id != MAP_FRAME:
