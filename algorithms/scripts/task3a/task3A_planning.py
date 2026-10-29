@@ -68,7 +68,7 @@ STEPS = (
 # The collision boxes in the eBot description are 0.62 x 0.49 m. A 5 mm
 # raster allowance compensates for discretization around the circle footprint.
 EBOT_RADIUS_M = math.hypot(0.62 / 2.0, 0.49 / 2.0) - 0.005
-CLEARANCE_MARGINS = (0.0,)
+CLEARANCE_MARGINS = (0.10, 0.05, 0.0)
 ENDPOINT_RELAX_RADIUS_M = 0.18
 PATH_SAMPLE_SPACING_M = 0.06
 STILL_LINEAR_MPS = 0.02
