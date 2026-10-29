@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
-"""Closed-loop Task 2A pick-and-sort controller for the UR7e magnet."""
+"""Task 3A arm: sort the ores (as in 2A) and move the ore package from the eBot to the crusher."""
 
 # Team ID:          [6131]
 # Author List:      [Agrim Chauhan, Saksham Kaushal, Rayhan Khan, Manan Sood]
-# Filename:         task2A_manipulation.py
-# Task:             2A - StrataCobot (eYRC 2026-27)
+# Filename:         task3A_manipulation.py
+# Task:             3A - StrataCobot (eYRC 2026-27)
 # Functions:
 #                   __init__, _now_seconds, _tcp_cb, _joints_cb, _status_cb, _force_cb, _position,
 #                   _tool_alignment, _publish_twist, _publish_joints, _stop, _move_toward,
 #                   _change_phase, _switch, _switch_result, _fresh_ore_transforms, _drop_target,
-#                   _side_x, _start_next_ore, _target_transform_position, _refresh_pick_target,
-#                   _begin_capture_check, _call_magnet, _service_result, _held, _fault, _step, main
+#                   _side_x, _reach_safe, _clamp_transit_waypoints, _start_next_ore, _target_transform_position, _refresh_pick_target,
+#                   _begin_capture_check, _call_magnet, _service_result, _held, _fault,
+#                   _at_arm_cb, _publish_cleared, _package_transform, _joint_move_toward,
+#                   _start_package, _package_step, _step, main
 # Nodes:
-#                   Name - [ task2a_manipulation ]
-#                   Publishing Topics - [ /delta_twist_cmds, /delta_joint_cmds ]
+#                   Name - [ task3a_manipulation ]
+#                   Publishing Topics - [ /delta_twist_cmds, /delta_joint_cmds, /package_cleared ]
 #                   Subscribing Topics - [ /tcp_pose_raw, /joint_states, /arm_status,
-#                       /ur7e/end_effector/force_magnitude, /tf, /tf_static, /clock ]
+#                       /ur7e/end_effector/force_magnitude, /ebot_at_arm, /tf, /tf_static,
+#                       /clock ]
 #                   Service Clients - [ /ur_arm_controller/switch_controller, /magnet ]
 
 ################### IMPORT MODULES #######################
@@ -29,8 +32,14 @@ from control_msgs.msg import JointJog
 from controller_manager_msgs.srv import SwitchController
 from geometry_msgs.msg import PoseStamped, TwistStamped
 from rclpy.node import Node
+from rclpy.qos import (
+    QoSDurabilityPolicy,
+    QoSHistoryPolicy,
+    QoSProfile,
+    QoSReliabilityPolicy,
+)
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Float32, Int32
+from std_msgs.msg import Bool, Float32, Int32
 from std_srvs.srv import SetBool
 
 
@@ -92,11 +101,47 @@ PICK_XY_SEARCH_OFFSETS = (
 )
 FORCE_COLLISION_THRESHOLD_N = 5.0
 
+# ---- Task 3A: the ore package ---------------------------------------------------
+# Handover topics (latched), shared with task3A_planning and task3A_perception.
+AT_ARM_TOPIC = '/ebot_at_arm'
+CLEARED_TOPIC = '/package_cleared'
+PACKAGE_FRAME = 'ore_package'
+# Accept a package transform only where an eBot deck beside the arm can be.
+# Measured 28 Oct: top face centre at (0.651, 0.091, 0.255) in base_link.
+PACKAGE_ROI = ((0.25, 1.05), (-0.45, 0.45), (0.10, 0.45))
+PACKAGE_HELD_N = 2.0            # the package reads about 2.94 N when held
+PACKAGE_STANDOFF = 0.02         # m above the top face before the magnet goes on
+PACKAGE_PRESS = 0.004           # m below the measured top face for the contact move
+PACKAGE_CLEARED_RISE = 0.08     # m above the top face before the eBot may leave
+PACKAGE_CARRY_Z = 0.42          # m; package bottom then ~0.34, over everything nearby
+PACKAGE_MAX_TRIES = 3
+# Hopper (crusher collision mesh, 27 Oct): opening x -1.123..-0.763, y -0.195..0.187
+# and rim z +0.207 in base_link. Reach test (29 Oct): with the tool tilted 20 deg
+# outward, the singularity warning starts at TCP x = -0.917 (z 0.33). Dropping at
+# -0.88 puts the package centre near -0.893, about 4 cm inside the near rim with
+# the long side along x, and keeps 3.7 cm from that warning.
+HOPPER_DROP = (-0.88, 0.0, 0.34)
+HOPPER_TILT = math.radians(20.0)
+HOPPER_STAGING = (-0.62, 0.0, PACKAGE_CARRY_Z)
+# Carry the package around the -y side so no move passes over the base axis.
+PACKAGE_ROUTE = ((0.30, -0.55, PACKAGE_CARRY_Z), (-0.35, -0.55, PACKAGE_CARRY_Z))
+# Reach envelope for transit waypoints, measured from the shoulder axis point.
+# Reach test (29 Oct): tool down at z +0.33, the singularity warning starts 0.885 m
+# from (0, 0, 0.1625). The 2A run in a 3A world latched 21 lifting azurite_ore_2
+# (picked at radius 0.84) straight up. Transit waypoints now stay inside 0.80 m;
+# only the pick itself (low, where the arm reaches further) may be outside.
+SHOULDER = (0.0, 0.0, 0.1625)
+TRANSIT_REACH = 0.80
+# Where the arm waits if it hides the package from the camera (the -y side).
+PACKAGE_LOOK_AWAY = (-0.35, -0.55, PACKAGE_CARRY_Z)
+SLOW_TWIST_SPEED = 0.05         # m/s for the last move into the drop pose
+JOINT_TOLERANCE = 0.01          # rad
+
 
 class Task2AManipulation(Node):
     def __init__(self):
         super().__init__(
-            'task2a_manipulation',
+            'task3a_manipulation',
             parameter_overrides=[rclpy.parameter.Parameter(
                 'use_sim_time', rclpy.Parameter.Type.BOOL, True)],
         )
@@ -117,6 +162,15 @@ class Task2AManipulation(Node):
         self.switch_client = self.create_client(
             SwitchController, f'{SERVO_NS}/switch_controller')
         self.magnet_client = self.create_client(SetBool, '/magnet')
+
+        latched_qos = QoSProfile(
+            depth=1,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.create_subscription(Bool, AT_ARM_TOPIC, self._at_arm_cb, latched_qos)
+        self.cleared_pub = self.create_publisher(Bool, CLEARED_TOPIC, latched_qos)
 
         self.tcp_pose = None
         self.joint_angles = None
@@ -153,9 +207,22 @@ class Task2AManipulation(Node):
         self.sorted_ores = set()
         self.failed_ores = set()
         self.fault_logged = False
+        # Task 3A package job
+        self.tool_axis_target = (0.0, 0.0, -1.0)
+        self.switch_target = None
+        self.ebot_at_arm = False
+        self.package_done = False
+        self.package_cleared_sent = False
+        self.package_target = None      # locked top-face centre of the package
+        self.package_tries = 0
+        self.package_wait_logged = False
+        self.package_look_logged = False
+        self.package_route_index = 0
+        self.staging_joints = None      # joint angles recorded at HOPPER_STAGING
+        self.package_phase_after_switch = None
         self.timer = self.create_timer(0.05, self._step)
         self.get_logger().info(
-            'Task 2A manipulation ready; waiting for arm feedback and Task 2A transforms.')
+            'Task 3A manipulation ready; waiting for arm feedback and ore transforms.')
 
     def _now_seconds(self):
         return self.get_clock().now().nanoseconds / 1e9
@@ -181,14 +248,19 @@ class Task2AManipulation(Node):
 
     def _tool_alignment(self):
         # tcp_pose_raw is the TCP pose, not the flange. TCP +Z is the magnet's
-        # outward normal (flange +X); align it with base_link -Z. Yaw is free.
+        # outward normal (flange +X); align it with tool_axis_target, which is
+        # base_link -Z (straight down) except at the hopper. Yaw is free.
         q = self.tcp_pose.orientation
         axis = (2.0 * (q.x * q.z + q.w * q.y),
                 2.0 * (q.y * q.z - q.w * q.x),
                 1.0 - 2.0 * (q.x * q.x + q.y * q.y))
-        cross = (-axis[1], axis[0], 0.0)
-        magnitude = math.hypot(cross[0], cross[1])
-        angle = math.atan2(magnitude, -axis[2])
+        d = self.tool_axis_target
+        # The angular velocity a x d turns the tool axis a towards d.
+        cross = (axis[1] * d[2] - axis[2] * d[1],
+                 axis[2] * d[0] - axis[0] * d[2],
+                 axis[0] * d[1] - axis[1] * d[0])
+        magnitude = math.sqrt(sum(v * v for v in cross))
+        angle = math.atan2(magnitude, sum(a * b for a, b in zip(axis, d)))
         if magnitude < 1e-9:
             return angle, (0.0, 0.0, 0.0)
         speed = min(ANGULAR_SPEED_LIMIT, ORIENTATION_GAIN * angle)
@@ -215,7 +287,8 @@ class Task2AManipulation(Node):
         elif self.active_controller == JOINT_CONTROLLER:
             self._publish_joints((0.0,) * 6)
 
-    def _move_toward(self, target, tolerance=POSITION_TOLERANCE):
+    def _move_toward(self, target, tolerance=POSITION_TOLERANCE,
+                     max_speed=TWIST_SPEED_LIMIT):
         current = self._position()
         error = [float(t) - c for t, c in zip(target, current)]
         distance = math.sqrt(sum(value * value for value in error))
@@ -228,15 +301,41 @@ class Task2AManipulation(Node):
         if tilt > math.radians(3.0):
             velocity = [0.0, 0.0, 0.0]
         speed = math.sqrt(sum(value * value for value in velocity))
-        if speed > TWIST_SPEED_LIMIT:
-            scale = TWIST_SPEED_LIMIT / speed
+        if speed > max_speed:
+            scale = max_speed / speed
             velocity = [value * scale for value in velocity]
         self._publish_twist(velocity, angular)
         return False
 
+    @staticmethod
+    def _reach_safe(point):
+        """Pull a transit waypoint towards the base axis until it is inside TRANSIT_REACH."""
+        x, y, z = point
+        dz = z - SHOULDER[2]
+        radius = math.hypot(x, y)
+        allowed = math.sqrt(max(0.0, TRANSIT_REACH ** 2 - dz * dz))
+        if radius <= allowed or radius < 1e-6:
+            return (x, y, z)
+        scale = max(allowed, 0.30) / radius
+        return (x * scale, y * scale, z)
+
+    def _clamp_transit_waypoints(self):
+        self.pick_transit_position = self._reach_safe(self.pick_transit_position)
+        self.pick_route_position = self._reach_safe(self.pick_route_position)
+        self.pick_side_position = self._reach_safe(self.pick_side_position)
+        self.transit_position = self._reach_safe(self.transit_position)
+        self.drop_route_position = self._reach_safe(self.drop_route_position)
+        self.drop_side_position = self._reach_safe(self.drop_side_position)
+
     def _change_phase(self, phase):
+        now = self._now_seconds()
+        if phase != self.phase:
+            # Sim-time trace of every phase, to see where the run's time goes.
+            self.get_logger().info(
+                f'[t={now:7.1f} s] {self.phase} -> {phase} '
+                f'(spent {now - self.phase_started:5.1f} s)')
         self.phase = phase
-        self.phase_started = self._now_seconds()
+        self.phase_started = now
 
     def _switch(self, activate, deactivate, next_phase):
         if not self.switch_client.service_is_ready():
@@ -247,6 +346,7 @@ class Task2AManipulation(Node):
         request.strictness = SwitchController.Request.STRICT
         self.switch_future = self.switch_client.call_async(request)
         self.next_phase = next_phase
+        self.switch_target = activate
         self._change_phase('wait_switch')
         self.get_logger().info(f'Switching arm control to {activate}.')
         return True
@@ -307,6 +407,14 @@ class Task2AManipulation(Node):
                       and item[2][1] < -0.25]
         if not candidates:
             if len(self.sorted_ores | self.failed_ores) >= EXPECTED_ORE_COUNT:
+                if not self.package_done:
+                    # Ores finished first: wait for the eBot with the package.
+                    if not self.package_wait_logged:
+                        self.get_logger().info(
+                            'Ores finished; waiting for the eBot to bring the package.')
+                        self.package_wait_logged = True
+                    self._publish_twist((0.0, 0.0, 0.0))
+                    return
                 self._change_phase('done')
                 if self.failed_ores:
                     self.get_logger().error(
@@ -366,6 +474,7 @@ class Task2AManipulation(Node):
             drop_side_x, pick_y, self.transit_position[2])
         self.drop_side_position = (
             drop_side_x, self.drop_position[1], self.transit_position[2])
+        self._clamp_transit_waypoints()
         self.pick_attempts = 0
         self.get_logger().info(
             f'Picking {frame} at ({self.ore_position[0]:.3f}, '
@@ -424,6 +533,7 @@ class Task2AManipulation(Node):
             drop_side_x, pick_y, self.transit_position[2])
         self.drop_side_position = (
             drop_side_x, self.drop_position[1], self.transit_position[2])
+        self._clamp_transit_waypoints()
 
     def _begin_capture_check(self):
         self.capture_reference_position = (
@@ -483,6 +593,247 @@ class Task2AManipulation(Node):
                 self.get_logger().error(message)
         self._change_phase('fault')
 
+    # ---- Task 3A: the ore package ---------------------------------------------------
+
+    def _at_arm_cb(self, msg):
+        if msg.data and not self.ebot_at_arm:
+            self.get_logger().info('eBot reports it is parked beside the arm.')
+        self.ebot_at_arm = bool(msg.data)
+
+    def _publish_cleared(self):
+        if self.package_cleared_sent:
+            return
+        msg = Bool()
+        msg.data = True
+        self.cleared_pub.publish(msg)
+        self.package_cleared_sent = True
+        self.get_logger().info('Package is off the deck; told the eBot it may leave.')
+
+    def _package_transform(self):
+        """Fresh ore_package position (top-face centre) in base_link, or None."""
+        try:
+            tf_msg = self.tf_buffer.lookup_transform(
+                BASE_FRAME, PACKAGE_FRAME, rclpy.time.Time())
+        except Exception:
+            return None
+        stamp = rclpy.time.Time.from_msg(tf_msg.header.stamp).nanoseconds
+        age = (self.get_clock().now().nanoseconds - stamp) / 1e9
+        if age < -0.05 or age > TF_MAX_AGE_S:
+            return None
+        t = tf_msg.transform.translation
+        point = (float(t.x), float(t.y), float(t.z))
+        (x0, x1), (y0, y1), (z0, z1) = PACKAGE_ROI
+        if not (x0 < point[0] < x1 and y0 < point[1] < y1 and z0 < point[2] < z1):
+            return None
+        return point
+
+    def _joint_move_toward(self, target):
+        """One tick of a straight joint-space move. True when every joint is there."""
+        errors = [t - c for t, c in zip(target, self.joint_angles)]
+        largest = max(abs(value) for value in errors)
+        if largest < JOINT_TOLERANCE:
+            self._publish_joints((0.0,) * 6)
+            return True
+        speed = min(JOINT_SPEED_LIMIT, 1.6 * largest)
+        self._publish_joints([(error / largest) * speed for error in errors])
+        return False
+
+    def _start_package(self):
+        self.package_target = None
+        self.package_tries = 0
+        self.package_route_index = 0
+        self.tool_axis_target = (0.0, 0.0, -1.0)
+        self.get_logger().info('Starting the package job.')
+        self._change_phase('pkg_rise')
+
+    def _package_step(self):
+        phase = self.phase
+        now = self._now_seconds()
+
+        if phase == 'pkg_rise':
+            # Straight up first, clear of the conveyor, the wells and the deck.
+            p = self._position()
+            if self._move_toward((p[0], p[1], max(p[2], PACKAGE_CARRY_Z))):
+                self._change_phase('pkg_find')
+            return
+
+        if phase == 'pkg_find':
+            point = self._package_transform()
+            if point is not None:
+                self.package_target = point
+                self.get_logger().info(
+                    f'Package top face at ({point[0]:.3f}, {point[1]:.3f}, '
+                    f'{point[2]:.3f}); moving above it.')
+                self._change_phase('pkg_above')
+                return
+            waited = now - self.phase_started
+            if waited > 3.0:
+                # Not visible from here: the arm may be between the camera and the
+                # deck. Lean over the -y side, out of the camera's line of sight.
+                if not self.package_look_logged:
+                    self.get_logger().warning(
+                        'No package transform yet; moving the arm out of the camera view.')
+                    self.package_look_logged = True
+                self._move_toward(PACKAGE_LOOK_AWAY)
+            else:
+                self._publish_twist((0.0, 0.0, 0.0))
+            if waited > 20.0:
+                self._fault('No ore_package transform within 20 s of the eBot arriving.')
+            return
+
+        if phase == 'pkg_above':
+            # Keep refining the target while the camera still sees the package.
+            point = self._package_transform()
+            if point is not None:
+                self.package_target = point
+            px, py, pz = self.package_target
+            if self._move_toward((px, py, PACKAGE_CARRY_Z)):
+                self._change_phase('pkg_descend')
+            return
+
+        if phase == 'pkg_descend':
+            # The wrist hides the package from here on: the target stays locked.
+            px, py, pz = self.package_target
+            if self._move_toward((px, py, pz + PACKAGE_STANDOFF)):
+                self._call_magnet(True, 'pkg_wait_magnet_on')
+            return
+
+        if phase == 'pkg_wait_magnet_on':
+            self._publish_twist((0.0, 0.0, 0.0))
+            result = self._service_result()
+            if result is None:
+                return
+            if not result:
+                self._fault('Could not enable the magnet for the package.')
+                return
+            self._change_phase('pkg_contact')
+            return
+
+        if phase == 'pkg_contact':
+            px, py, pz = self.package_target
+            press = PACKAGE_PRESS + 0.004 * self.package_tries
+            force_fresh = (self.force_time is not None and now - self.force_time < 0.5)
+            reached = self._move_toward(
+                (px, py, pz - press), tolerance=PICK_POSITION_TOLERANCE * 4,
+                max_speed=SLOW_TWIST_SPEED)
+            hard = force_fresh and self.force_n >= FORCE_APPROACH_LIMIT_N
+            if reached or hard or now - self.phase_started > 4.0:
+                self._change_phase('pkg_test_lift')
+            return
+
+        if phase == 'pkg_test_lift':
+            px, py, pz = self.package_target
+            if self._move_toward((px, py, pz + 0.05)):
+                self._change_phase('pkg_test_hold')
+            return
+
+        if phase == 'pkg_test_hold':
+            self._publish_twist((0.0, 0.0, 0.0))
+            if now - self.phase_started < 0.6:
+                return
+            force_fresh = (self.force_time is not None and now - self.force_time < 0.5)
+            if force_fresh and self.force_n >= PACKAGE_HELD_N:
+                self.get_logger().info(
+                    f'Package held ({self.force_n:.2f} N); lifting it off the deck.')
+                self._change_phase('pkg_lift')
+                return
+            self.package_tries += 1
+            self.get_logger().warning(
+                f'Package not held (force {self.force_n}); attempt '
+                f'{self.package_tries}/{PACKAGE_MAX_TRIES}.')
+            if self.package_tries >= PACKAGE_MAX_TRIES:
+                self._fault('The package could not be picked.')
+                return
+            self._call_magnet(False, 'pkg_wait_retry_release')
+            return
+
+        if phase == 'pkg_wait_retry_release':
+            self._publish_twist((0.0, 0.0, 0.0))
+            result = self._service_result()
+            if result is None:
+                return
+            self._change_phase('pkg_descend')
+            return
+
+        if phase == 'pkg_lift':
+            px, py, pz = self.package_target
+            if self._position()[2] >= pz + PACKAGE_CLEARED_RISE and self._held():
+                self._publish_cleared()
+            if self._move_toward((px, py, PACKAGE_CARRY_Z)):
+                self._publish_cleared()
+                self.package_route_index = 0
+                self._change_phase('pkg_route')
+            return
+
+        if phase == 'pkg_route':
+            if self.package_route_index >= len(PACKAGE_ROUTE):
+                self._change_phase('pkg_staging')
+                return
+            if self._move_toward(PACKAGE_ROUTE[self.package_route_index]):
+                self.package_route_index += 1
+            return
+
+        if phase == 'pkg_staging':
+            if self._move_toward(HOPPER_STAGING):
+                # Tilt the magnet face outward, towards the hopper, in place.
+                self.tool_axis_target = (
+                    -math.sin(HOPPER_TILT), 0.0, -math.cos(HOPPER_TILT))
+                self._change_phase('pkg_tilt')
+            return
+
+        if phase == 'pkg_tilt':
+            if self._move_toward(HOPPER_STAGING):
+                # Remember this configuration: the way out is a joint move back to it.
+                self.staging_joints = list(self.joint_angles)
+                self._change_phase('pkg_to_drop')
+            return
+
+        if phase == 'pkg_to_drop':
+            if self.arm_status is not None and 10 <= self.arm_status <= 19:
+                self.get_logger().warning(
+                    f'Arm warning {self.arm_status} on the way to the hopper; '
+                    'releasing here.')
+                self._call_magnet(False, 'pkg_wait_release')
+                return
+            if self._move_toward(HOPPER_DROP, max_speed=SLOW_TWIST_SPEED):
+                self._call_magnet(False, 'pkg_wait_release')
+            return
+
+        if phase == 'pkg_wait_release':
+            self._publish_twist((0.0, 0.0, 0.0))
+            result = self._service_result()
+            if result is None:
+                return
+            if not result:
+                self._fault('Could not turn off the magnet over the hopper.')
+                return
+            self._change_phase('pkg_verify_release')
+            return
+
+        if phase == 'pkg_verify_release':
+            self._publish_twist((0.0, 0.0, 0.0))
+            force_fresh = (self.force_time is not None and now - self.force_time < 0.5)
+            if force_fresh and self.force_n < FORCE_HELD_THRESHOLD_N:
+                self.get_logger().info('Package released over the crusher hopper.')
+                self._switch(JOINT_CONTROLLER, TWIST_CONTROLLER, 'pkg_exit')
+                return
+            if now - self.phase_started > 1.5:
+                self._fault('Payload force did not clear after releasing the package.')
+            return
+
+        if phase == 'pkg_exit':
+            # Leave the hopper in joint space. A straight Cartesian move back from
+            # near full stretch is the direction the arm can barely produce
+            # (the reach test latched 21 doing exactly that).
+            if self._joint_move_toward(self.staging_joints):
+                self.tool_axis_target = (0.0, 0.0, -1.0)
+                self.package_done = True
+                self.get_logger().info('Package job done.')
+                self._switch(TWIST_CONTROLLER, JOINT_CONTROLLER, 'select')
+            return
+
+        self._fault(f'Unknown package phase: {phase}')
+
     def _step(self):
         if self.arm_status is not None and 20 <= self.arm_status <= 23:
             self._fault(
@@ -512,8 +863,7 @@ class Task2AManipulation(Node):
             if not result:
                 self._fault('The arm controller switch was rejected.')
                 return
-            self.active_controller = (
-                JOINT_CONTROLLER if self.next_phase == 'unfold' else TWIST_CONTROLLER)
+            self.active_controller = self.switch_target
             self._change_phase(self.next_phase)
             return
 
@@ -538,14 +888,23 @@ class Task2AManipulation(Node):
             return
 
         if self.phase == 'select':
+            # The package goes first as soon as the eBot is parked with it, so the
+            # eBot's drive home overlaps with the remaining ore sorting.
+            if self.ebot_at_arm and not self.package_done:
+                self._start_package()
+                return
             self._start_next_ore()
+            return
+
+        if self.phase.startswith('pkg_'):
+            self._package_step()
             return
 
         if self.phase == 'prepare_pick':
             self._refresh_pick_target()
             current = self._position()
             safe_z = max(current[2], self.pick_transit_position[2])
-            if self._move_toward((current[0], current[1], safe_z)):
+            if self._move_toward(self._reach_safe((current[0], current[1], safe_z))):
                 self._change_phase('transit_to_pick')
             return
 
@@ -729,14 +1088,17 @@ class Task2AManipulation(Node):
 
         if self.phase == 'skip_failed_pick':
             current = self._position()
-            if self._move_toward((current[0], current[1], CARRY_CLEARANCE)):
+            if self._move_toward(
+                    self._reach_safe((current[0], current[1], CARRY_CLEARANCE))):
                 self.target_name = None
                 self._change_phase('select')
             return
 
         if self.phase == 'lift':
-            target = (self.pick_position[0], self.pick_position[1],
-                      self.transit_position[2])
+            # Up and inwards together: straight up from a far ore runs into
+            # full stretch.
+            target = self._reach_safe((self.pick_position[0], self.pick_position[1],
+                                       self.transit_position[2]))
             if self._move_toward(target):
                 self._change_phase('transit_to_drop_route')
             return
