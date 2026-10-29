@@ -12,6 +12,7 @@
 #                   _side_x, _reach_safe, _clamp_transit_waypoints, _start_next_ore, _target_transform_position, _refresh_pick_target,
 #                   _begin_capture_check, _call_magnet, _service_result, _held, _fault,
 #                   _at_arm_cb, _publish_cleared, _package_transform, _joint_move_toward,
+#                   _begin_sweep,
 #                   _start_package, _package_step, _step, main
 # Nodes:
 #                   Name - [ task3a_manipulation ]
@@ -123,8 +124,14 @@ PACKAGE_MAX_TRIES = 3
 HOPPER_DROP = (-0.88, 0.0, 0.34)
 HOPPER_TILT = math.radians(20.0)
 HOPPER_STAGING = (-0.62, 0.0, PACKAGE_CARRY_Z)
-# Carry the package around the -y side so no move passes over the base axis.
-PACKAGE_ROUTE = ((0.30, -0.55, PACKAGE_CARRY_Z), (-0.35, -0.55, PACKAGE_CARRY_Z))
+# Big heading changes are made by turning shoulder_pan alone ("sweeps"): the TCP
+# then circles the base at constant radius and height, and we choose which way
+# round so the pan joint stays inside its +-2 pi limit. Run 29 Oct: a Cartesian
+# route wound the pan to -6.2822 rad and latched CRITICAL_JOINT_LIMIT (20).
+PAN_LIMIT = 2.0 * math.pi - 0.35        # rad, stay this far inside the joint limit
+PAN_PREFERRED = -math.pi                # 2A's ore work lives around here
+SWEEP_SPEED = 0.45                      # rad/s, under the 0.60 rad/s Task 3 limit
+HOPPER_HEADING = math.pi                # the hopper is straight behind the arm
 # Reach envelope for transit waypoints, measured from the shoulder axis point.
 # Reach test (29 Oct): tool down at z +0.33, the singularity warning starts 0.885 m
 # from (0, 0, 0.1625). The 2A run in a 3A world latched 21 lifting azurite_ore_2
@@ -132,8 +139,8 @@ PACKAGE_ROUTE = ((0.30, -0.55, PACKAGE_CARRY_Z), (-0.35, -0.55, PACKAGE_CARRY_Z)
 # only the pick itself (low, where the arm reaches further) may be outside.
 SHOULDER = (0.0, 0.0, 0.1625)
 TRANSIT_REACH = 0.80
-# Where the arm waits if it hides the package from the camera (the -y side).
-PACKAGE_LOOK_AWAY = (-0.35, -0.55, PACKAGE_CARRY_Z)
+# Where the arm turns to if it hides the package from the camera: the -y side.
+LOOK_AWAY_HEADING = math.radians(-122.0)
 SLOW_TWIST_SPEED = 0.05         # m/s for the last move into the drop pose
 JOINT_TOLERANCE = 0.01          # rad
 
@@ -217,7 +224,10 @@ class Task2AManipulation(Node):
         self.package_tries = 0
         self.package_wait_logged = False
         self.package_look_logged = False
-        self.package_route_index = 0
+        self.package_find_started = 0.0
+        self.package_looked_away = False
+        self.sweep_joints = None
+        self.sweep_next = None
         self.staging_joints = None      # joint angles recorded at HOPPER_STAGING
         self.package_phase_after_switch = None
         self.timer = self.create_timer(0.05, self._step)
@@ -627,21 +637,46 @@ class Task2AManipulation(Node):
             return None
         return point
 
-    def _joint_move_toward(self, target):
+    def _joint_move_toward(self, target, max_speed=JOINT_SPEED_LIMIT):
         """One tick of a straight joint-space move. True when every joint is there."""
         errors = [t - c for t, c in zip(target, self.joint_angles)]
         largest = max(abs(value) for value in errors)
         if largest < JOINT_TOLERANCE:
             self._publish_joints((0.0,) * 6)
             return True
-        speed = min(JOINT_SPEED_LIMIT, 1.6 * largest)
+        speed = min(max_speed, 1.6 * largest)
         self._publish_joints([(error / largest) * speed for error in errors])
         return False
+
+    def _begin_sweep(self, heading, next_phase):
+        """Turn shoulder_pan alone so the TCP faces `heading` (rad, base_link).
+
+        Rotating joint 1 by d rotates the whole arm about the base z axis, so the
+        TCP heading changes by exactly d. Of the pan angles that give the wanted
+        heading, take the one inside the joint limit nearest the current pan
+        (ties go to the one nearer PAN_PREFERRED).
+        """
+        p = self._position()
+        current_heading = math.atan2(p[1], p[0])
+        pan = self.joint_angles[0]
+        delta = math.atan2(math.sin(heading - current_heading),
+                           math.cos(heading - current_heading))
+        candidates = [pan + delta + k * 2.0 * math.pi for k in (-1, 0, 1)]
+        candidates = [c for c in candidates if abs(c) <= PAN_LIMIT]
+        target_pan = min(candidates, key=lambda c: (
+            abs(c - pan) + 0.01 * abs(c - PAN_PREFERRED)))
+        self.sweep_joints = [target_pan] + list(self.joint_angles[1:])
+        self.sweep_next = next_phase
+        self.get_logger().info(
+            f'Sweeping shoulder_pan {pan:+.2f} -> {target_pan:+.2f} rad '
+            f'(heading {math.degrees(heading):+.0f} deg).')
+        self._change_phase('pkg_sweep_start')
 
     def _start_package(self):
         self.package_target = None
         self.package_tries = 0
-        self.package_route_index = 0
+        self.package_find_started = self._now_seconds()
+        self.package_looked_away = False
         self.tool_axis_target = (0.0, 0.0, -1.0)
         self.get_logger().info('Starting the package job.')
         self._change_phase('pkg_rise')
@@ -653,8 +688,23 @@ class Task2AManipulation(Node):
         if phase == 'pkg_rise':
             # Straight up first, clear of the conveyor, the wells and the deck.
             p = self._position()
-            if self._move_toward((p[0], p[1], max(p[2], PACKAGE_CARRY_Z))):
+            if self._move_toward(self._reach_safe((p[0], p[1], max(p[2], PACKAGE_CARRY_Z)))):
                 self._change_phase('pkg_find')
+            return
+
+        if phase == 'pkg_sweep_start':
+            self._publish_twist((0.0, 0.0, 0.0))
+            self._switch(JOINT_CONTROLLER, TWIST_CONTROLLER, 'pkg_sweep')
+            return
+
+        if phase == 'pkg_sweep':
+            if self._joint_move_toward(self.sweep_joints, max_speed=SWEEP_SPEED):
+                self._change_phase('pkg_sweep_end')
+            return
+
+        if phase == 'pkg_sweep_end':
+            self._publish_joints((0.0,) * 6)
+            self._switch(TWIST_CONTROLLER, JOINT_CONTROLLER, self.sweep_next)
             return
 
         if phase == 'pkg_find':
@@ -663,22 +713,23 @@ class Task2AManipulation(Node):
                 self.package_target = point
                 self.get_logger().info(
                     f'Package top face at ({point[0]:.3f}, {point[1]:.3f}, '
-                    f'{point[2]:.3f}); moving above it.')
-                self._change_phase('pkg_above')
+                    f'{point[2]:.3f}); turning towards it.')
+                self._begin_sweep(math.atan2(point[1], point[0]), 'pkg_above')
                 return
-            waited = now - self.phase_started
-            if waited > 3.0:
+            self._publish_twist((0.0, 0.0, 0.0))
+            waited = now - self.package_find_started
+            if waited > 3.0 and not self.package_looked_away:
                 # Not visible from here: the arm may be between the camera and the
-                # deck. Lean over the -y side, out of the camera's line of sight.
+                # deck. Turn over the -y side, out of the camera's line of sight.
+                self.package_looked_away = True
                 if not self.package_look_logged:
                     self.get_logger().warning(
-                        'No package transform yet; moving the arm out of the camera view.')
+                        'No package transform yet; turning the arm out of the camera view.')
                     self.package_look_logged = True
-                self._move_toward(PACKAGE_LOOK_AWAY)
-            else:
-                self._publish_twist((0.0, 0.0, 0.0))
-            if waited > 20.0:
-                self._fault('No ore_package transform within 20 s of the eBot arriving.')
+                self._begin_sweep(LOOK_AWAY_HEADING, 'pkg_find')
+                return
+            if waited > 25.0:
+                self._fault('No ore_package transform within 25 s of the eBot arriving.')
             return
 
         if phase == 'pkg_above':
@@ -761,16 +812,7 @@ class Task2AManipulation(Node):
                 self._publish_cleared()
             if self._move_toward((px, py, PACKAGE_CARRY_Z)):
                 self._publish_cleared()
-                self.package_route_index = 0
-                self._change_phase('pkg_route')
-            return
-
-        if phase == 'pkg_route':
-            if self.package_route_index >= len(PACKAGE_ROUTE):
-                self._change_phase('pkg_staging')
-                return
-            if self._move_toward(PACKAGE_ROUTE[self.package_route_index]):
-                self.package_route_index += 1
+                self._begin_sweep(HOPPER_HEADING, 'pkg_staging')
             return
 
         if phase == 'pkg_staging':
