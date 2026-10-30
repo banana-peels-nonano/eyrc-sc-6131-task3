@@ -137,6 +137,12 @@ SWEEP_SPEED = 0.55                      # rad/s, under the 0.60 rad/s Task 3 lim
 # the base, and far enough from the base axis that the pan rate stays low.
 # Speed pack run (30 Oct): the Cartesian route took 6.8-15.9 s per transfer.
 SWEEP_RADIUS = 0.55
+# A sweep only has to land near its heading: the Cartesian move after it absorbs
+# the rest. Batch 2 run: sweeps spent ~2 s creeping into 0.01 rad at gain 1.6.
+SWEEP_TOLERANCE = 0.03                  # rad, about 1.7 cm at SWEEP_RADIUS
+SWEEP_GAIN = 3.0                        # 1/s
+# Pre-pick hover: the move after it (to the ore) is the precise one.
+APPROACH_TOLERANCE = 0.01               # m
 HOPPER_HEADING = math.pi                # the hopper is straight behind the arm
 # Ore phases that may be abandoned when the eBot arrives with the package: the
 # magnet is still off, so nothing is held. The ore is simply re-selected later.
@@ -233,6 +239,7 @@ class Task2AManipulation(Node):
         self.package_target = None      # locked top-face centre of the package
         self.package_tries = 0
         self.package_wait_logged = False
+        self.drop_nudged = False
         self.package_look_logged = False
         self.package_find_started = 0.0
         self.package_looked_away = False
@@ -647,14 +654,15 @@ class Task2AManipulation(Node):
             return None
         return point
 
-    def _joint_move_toward(self, target, max_speed=JOINT_SPEED_LIMIT):
+    def _joint_move_toward(self, target, max_speed=JOINT_SPEED_LIMIT,
+                           tolerance=JOINT_TOLERANCE, gain=1.6):
         """One tick of a straight joint-space move. True when every joint is there."""
         errors = [t - c for t, c in zip(target, self.joint_angles)]
         largest = max(abs(value) for value in errors)
-        if largest < JOINT_TOLERANCE:
+        if largest < tolerance:
             self._publish_joints((0.0,) * 6)
             return True
-        speed = min(max_speed, 1.6 * largest)
+        speed = min(max_speed, gain * largest)
         self._publish_joints([(error / largest) * speed for error in errors])
         return False
 
@@ -714,7 +722,8 @@ class Task2AManipulation(Node):
             return
 
         if phase == 'pkg_sweep':
-            if self._joint_move_toward(self.sweep_joints, max_speed=SWEEP_SPEED):
+            if self._joint_move_toward(self.sweep_joints, max_speed=SWEEP_SPEED,
+                                       tolerance=SWEEP_TOLERANCE, gain=SWEEP_GAIN):
                 self._change_phase('pkg_sweep_end')
             return
 
@@ -1005,7 +1014,7 @@ class Task2AManipulation(Node):
             self._refresh_pick_target()
             target = (self.pick_position[0], self.pick_position[1],
                       self.pick_position[2] + PICK_APPROACH_STANDOFF)
-            if self._move_toward(target):
+            if self._move_toward(target, tolerance=APPROACH_TOLERANCE):
                 self._change_phase('enable_magnet')
             return
 
@@ -1168,10 +1177,12 @@ class Task2AManipulation(Node):
             return
 
         if self.phase == 'lift':
-            # Up and inwards together: straight up from a far ore runs into
-            # full stretch.
-            target = self._reach_safe((self.pick_position[0], self.pick_position[1],
-                                       self.transit_position[2]))
+            # Up and inwards together, straight onto the sweep circle: straight up
+            # from a far ore runs into full stretch, and a separate move in to the
+            # circle cost 1.3-7.1 s per ore in the batch 2 run.
+            heading = math.atan2(self.pick_position[1], self.pick_position[0])
+            target = (SWEEP_RADIUS * math.cos(heading), SWEEP_RADIUS * math.sin(heading),
+                      self.transit_position[2])
             if self._move_toward(target, tolerance=VIA_TOLERANCE):
                 self._change_phase('transit_to_drop_route')
             return
@@ -1194,7 +1205,10 @@ class Task2AManipulation(Node):
             return
 
         if self.phase == 'approach_drop':
+            # Precise (4 mm): with 1 cm here, batch 3 released vanadinite_ore_2 over
+            # the edge of the far well and the payload force never cleared.
             if self._move_toward(self.drop_position):
+                self.drop_nudged = False
                 self._change_phase('call_magnet_off')
             return
 
@@ -1228,7 +1242,23 @@ class Task2AManipulation(Node):
                 self._change_phase('retreat')
                 return
             if self._now_seconds() - self.phase_started > 1.5:
+                if not self.drop_nudged:
+                    # The ore may be resting on a well edge against the magnet face:
+                    # lift the (switched-off) tool away once and check again.
+                    self.drop_nudged = True
+                    self.get_logger().warning(
+                        f'Payload force still {self.force_n} N after releasing '
+                        f'{self.target_name}; lifting the tool clear and re-checking.')
+                    self._change_phase('drop_nudge')
+                    return
                 self._fault(f'Payload force did not clear after releasing {self.target_name}.')
+            return
+
+        if self.phase == 'drop_nudge':
+            target = (self.drop_position[0], self.drop_position[1],
+                      self.drop_position[2] + 0.05)
+            if self._move_toward(target, tolerance=VIA_TOLERANCE):
+                self._change_phase('verify_drop')
             return
 
         if self.phase == 'retreat':
