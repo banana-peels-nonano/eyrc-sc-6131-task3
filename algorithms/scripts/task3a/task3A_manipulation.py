@@ -77,15 +77,14 @@ DROP_HEIGHT_BASE = 0.04
 # This pose points the magnet's local +X face vertically down while keeping the
 # arm above the conveyor, ready for Cartesian pick-and-place motion.
 UNFOLD_POSE = (-2.0216, -2.1366, -1.5538, -1.0221, 1.5708, 1.5708)
-JOINT_SPEED_LIMIT = 0.20
-TWIST_SPEED_LIMIT = 0.12
-POSITION_GAIN = 0.75
+JOINT_SPEED_LIMIT = 0.40     # rad/s; Task 3 limit is 0.60 (was 0.20 in 2A)
+TWIST_SPEED_LIMIT = 0.20     # m/s; Task 3 limit is 0.25 (was 0.12 in 2A)
+POSITION_GAIN = 1.5          # 1/s; tail time constant 0.67 s (was 0.75 -> 1.33 s)
 ORIENTATION_GAIN = 1.5
 ANGULAR_SPEED_LIMIT = 0.3
 ORIENTATION_TOLERANCE = math.radians(0.5)
 POSITION_TOLERANCE = 0.004
-VIA_TOLERANCE = 0.03    
-# m; waypoints only the arm passes through
+VIA_TOLERANCE = 0.03    # m; waypoints the arm only passes through
 PICK_POSITION_TOLERANCE = 0.0005
 FORCE_HELD_THRESHOLD_N = 0.50
 FORCE_APPROACH_LIMIT_N = 15.0
@@ -134,6 +133,10 @@ PAN_LIMIT = 2.0 * math.pi - 0.35        # rad, stay this far inside the joint li
 PAN_PREFERRED = -math.pi                # 2A's ore work lives around here
 SWEEP_SPEED = 0.45                      # rad/s, under the 0.60 rad/s Task 3 limit
 HOPPER_HEADING = math.pi                # the hopper is straight behind the arm
+# Ore phases that may be abandoned when the eBot arrives with the package: the
+# magnet is still off, so nothing is held. The ore is simply re-selected later.
+PREEMPTABLE_PHASES = ('prepare_pick', 'transit_to_pick', 'transit_route_to_pick',
+                      'transit_final_to_pick', 'approach_pick')
 # Reach envelope for transit waypoints, measured from the shoulder axis point.
 # Reach test (29 Oct): tool down at z +0.33, the singularity warning starts 0.885 m
 # from (0, 0, 0.1625). The 2A run in a 3A world latched 21 lifting azurite_ore_2
@@ -890,6 +893,16 @@ class Task2AManipulation(Node):
         if self.phase == 'done':
             if self.active_controller == TWIST_CONTROLLER:
                 self._publish_twist((0.0, 0.0, 0.0))
+            return
+
+        if (self.ebot_at_arm and not self.package_done
+                and self.phase in PREEMPTABLE_PHASES):
+            # The eBot waits idle until the package is off its deck; serve it now.
+            self.get_logger().info(
+                f'eBot is waiting: leaving {self.target_name} for later.')
+            self.target_name = None
+            self.pick_target_locked = False
+            self._start_package()
             return
 
         if self.phase == 'wait_ready':

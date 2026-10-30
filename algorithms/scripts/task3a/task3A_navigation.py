@@ -35,9 +35,9 @@ ODOM_TOPIC = '/odom'
 CMD_TOPIC = '/cmd_vel'
 MAP_FRAME = 'map'
 
-MAX_LINEAR_MPS = 0.20
-MAX_ANGULAR_RPS = 0.65
-LOOKAHEAD_DISTANCE_M = 0.12
+MAX_LINEAR_MPS = 0.25      # m/s; eBot limit 0.5 (was 0.20 in 2B)
+MAX_ANGULAR_RPS = 0.80     # rad/s; eBot limit 1.0 (was 0.65 in 2B)
+LOOKAHEAD_DISTANCE_M = 0.15  # keeps the steering loop damped (zeta ~0.5) at 0.25 m/s
 FINAL_POSITION_TOLERANCE_M = 0.06
 FINAL_POSITION_RELEASE_M = 0.15
 FINAL_YAW_TOLERANCE_RAD = 0.05
@@ -255,7 +255,6 @@ class EbotNavigation(Node):
         target_x, target_y = self._lookahead_target(x, y)
         dx = target_x - x
         dy = target_y - y
-        distance = math.hypot(dx, dy)
 
         if self.current_waypoint != self.turn_target_index:
             self.turn_target_index = self.current_waypoint
@@ -288,7 +287,10 @@ class EbotNavigation(Node):
         if abs(heading_error) > 0.65:
             linear = 0.0
         else:
-            linear = min(MAX_LINEAR_MPS, 0.75 * distance)
+            # Slow down for the end of the path, not for the carrot: the carrot is
+            # always ~LOOKAHEAD ahead, so 0.75 * distance capped the 2B eBot at
+            # about 0.09-0.13 m/s however high MAX_LINEAR_MPS was set.
+            linear = min(MAX_LINEAR_MPS, 0.75 * end_distance)
             linear *= max(0.0, math.cos(heading_error))
 
         self._publish_velocity(linear, angular)
