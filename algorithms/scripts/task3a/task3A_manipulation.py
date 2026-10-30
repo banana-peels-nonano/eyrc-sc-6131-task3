@@ -84,6 +84,8 @@ ORIENTATION_GAIN = 1.5
 ANGULAR_SPEED_LIMIT = 0.3
 ORIENTATION_TOLERANCE = math.radians(0.5)
 POSITION_TOLERANCE = 0.004
+VIA_TOLERANCE = 0.03    
+# m; waypoints only the arm passes through
 PICK_POSITION_TOLERANCE = 0.0005
 FORCE_HELD_THRESHOLD_N = 0.50
 FORCE_APPROACH_LIMIT_N = 15.0
@@ -946,24 +948,24 @@ class Task2AManipulation(Node):
             self._refresh_pick_target()
             current = self._position()
             safe_z = max(current[2], self.pick_transit_position[2])
-            if self._move_toward(self._reach_safe((current[0], current[1], safe_z))):
+            if self._move_toward(self._reach_safe((current[0], current[1], safe_z)), tolerance=VIA_TOLERANCE):
                 self._change_phase('transit_to_pick')
             return
 
         if self.phase == 'transit_to_pick':
-            if self._move_toward(self.pick_route_position):
+            if self._move_toward(self.pick_route_position, tolerance=VIA_TOLERANCE):
                 self._change_phase('transit_route_to_pick')
             return
 
         if self.phase == 'transit_route_to_pick':
             self._refresh_pick_target()
-            if self._move_toward(self.pick_side_position):
+            if self._move_toward(self.pick_side_position, tolerance=VIA_TOLERANCE):
                 self._change_phase('transit_final_to_pick')
             return
 
         if self.phase == 'transit_final_to_pick':
             self._refresh_pick_target()
-            if self._move_toward(self.pick_transit_position):
+            if self._move_toward(self.pick_transit_position, tolerance=VIA_TOLERANCE):
                 # The wrist hides the marker during descent. Its last complete
                 # camera observation remains the pickup target until we lift away.
                 self.pick_target_locked = True
@@ -1141,22 +1143,22 @@ class Task2AManipulation(Node):
             # full stretch.
             target = self._reach_safe((self.pick_position[0], self.pick_position[1],
                                        self.transit_position[2]))
-            if self._move_toward(target):
+            if self._move_toward(target, tolerance=VIA_TOLERANCE):
                 self._change_phase('transit_to_drop_route')
             return
 
         if self.phase == 'transit_to_drop_route':
-            if self._move_toward(self.drop_route_position):
+            if self._move_toward(self.drop_route_position, tolerance=VIA_TOLERANCE):
                 self._change_phase('transit_to_drop')
             return
 
         if self.phase == 'transit_to_drop':
-            if self._move_toward(self.drop_side_position):
+            if self._move_toward(self.drop_side_position, tolerance=VIA_TOLERANCE):
                 self._change_phase('transit_final_to_drop')
             return
 
         if self.phase == 'transit_final_to_drop':
-            if self._move_toward(self.transit_position):
+            if self._move_toward(self.transit_position, tolerance=VIA_TOLERANCE):
                 self._change_phase('approach_drop')
             return
 
@@ -1199,7 +1201,7 @@ class Task2AManipulation(Node):
             return
 
         if self.phase == 'retreat':
-            if self._move_toward(self.transit_position):
+            if self._move_toward(self.transit_position, tolerance=VIA_TOLERANCE):
                 self._change_phase('select')
             return
 
