@@ -12,7 +12,7 @@
 #                   _side_x, _reach_safe, _clamp_transit_waypoints, _start_next_ore, _target_transform_position, _refresh_pick_target,
 #                   _begin_capture_check, _call_magnet, _service_result, _held, _fault,
 #                   _at_arm_cb, _publish_cleared, _package_transform, _joint_move_toward,
-#                   _begin_sweep,
+#                   _begin_sweep, _on_sweep_circle,
 #                   _start_package, _package_step, _step, main
 # Nodes:
 #                   Name - [ task3a_manipulation ]
@@ -131,7 +131,12 @@ HOPPER_STAGING = (-0.62, 0.0, PACKAGE_CARRY_Z)
 # route wound the pan to -6.2822 rad and latched CRITICAL_JOINT_LIMIT (20).
 PAN_LIMIT = 2.0 * math.pi - 0.35        # rad, stay this far inside the joint limit
 PAN_PREFERRED = -math.pi                # 2A's ore work lives around here
-SWEEP_SPEED = 0.45                      # rad/s, under the 0.60 rad/s Task 3 limit
+SWEEP_SPEED = 0.55                      # rad/s, under the 0.60 rad/s Task 3 limit
+# Ore transfers between the conveyor (-y) and the wells (+y) also go by sweep, at
+# this radius: inside the hopper's near wall (base x -0.651) when passing behind
+# the base, and far enough from the base axis that the pan rate stays low.
+# Speed pack run (30 Oct): the Cartesian route took 6.8-15.9 s per transfer.
+SWEEP_RADIUS = 0.55
 HOPPER_HEADING = math.pi                # the hopper is straight behind the arm
 # Ore phases that may be abandoned when the eBot arrives with the package: the
 # magnet is still off, so nothing is held. The ore is simply re-selected later.
@@ -677,6 +682,12 @@ class Task2AManipulation(Node):
             f'(heading {math.degrees(heading):+.0f} deg).')
         self._change_phase('pkg_sweep_start')
 
+    def _on_sweep_circle(self):
+        """The point at SWEEP_RADIUS on the TCP's current heading, at its current height."""
+        p = self._position()
+        heading = math.atan2(p[1], p[0])
+        return (SWEEP_RADIUS * math.cos(heading), SWEEP_RADIUS * math.sin(heading), p[2])
+
     def _start_package(self):
         self.package_target = None
         self.package_tries = 0
@@ -966,8 +977,13 @@ class Task2AManipulation(Node):
             return
 
         if self.phase == 'transit_to_pick':
-            if self._move_toward(self.pick_route_position, tolerance=VIA_TOLERANCE):
-                self._change_phase('transit_route_to_pick')
+            # Radially to SWEEP_RADIUS on the current heading, then sweep the pan
+            # round to the ore's heading.
+            if self._move_toward(self._on_sweep_circle(), tolerance=VIA_TOLERANCE):
+                self._refresh_pick_target()
+                self._begin_sweep(
+                    math.atan2(self.pick_position[1], self.pick_position[0]),
+                    'transit_final_to_pick')
             return
 
         if self.phase == 'transit_route_to_pick':
@@ -1161,8 +1177,10 @@ class Task2AManipulation(Node):
             return
 
         if self.phase == 'transit_to_drop_route':
-            if self._move_toward(self.drop_route_position, tolerance=VIA_TOLERANCE):
-                self._change_phase('transit_to_drop')
+            if self._move_toward(self._on_sweep_circle(), tolerance=VIA_TOLERANCE):
+                self._begin_sweep(
+                    math.atan2(self.drop_position[1], self.drop_position[0]),
+                    'transit_final_to_drop')
             return
 
         if self.phase == 'transit_to_drop':
