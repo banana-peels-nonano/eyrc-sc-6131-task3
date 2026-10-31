@@ -77,6 +77,11 @@ EBOT_RADIUS_M = math.hypot(0.62 / 2.0, 0.49 / 2.0) - 0.005
 # first; a quick connectivity test skips the ones with no way through.
 CLEARANCE_MARGINS = (0.25, 0.20, 0.15, 0.10, 0.05, 0.0)
 ENDPOINT_RELAX_RADIUS_M = 0.18
+# The extra margin grows from zero at the leg's fixed endpoints to its full value
+# MARGIN_TAPER_M away from them. 3B batch 1 run: margins of 0.10 m and more found no
+# path at all on legs 1-2, because the fixed poses themselves sit within that
+# margin of walls or rocks; mid-route, where the displaced rocks are, there is room.
+MARGIN_TAPER_M = 0.8
 PATH_SAMPLE_SPACING_M = 0.06
 
 
@@ -290,8 +295,19 @@ class EbotPlanner(Node):
         # the world on a raster; adding half a cell diagonal here as well would
         # inflate the robot beyond the benchmark and systematically lengthen
         # every detour.
-        full_clearance = EBOT_RADIUS_M + extra_margin
-        free = self.clearance >= full_clearance
+        if extra_margin <= 0.0:
+            free = self.clearance >= EBOT_RADIUS_M
+        else:
+            height, width = self.clearance.shape
+            rows = np.arange(height, dtype=np.float32)[:, None] + 0.5
+            cols = np.arange(width, dtype=np.float32)[None, :] + 0.5
+            nearest = None
+            for pose in (start, end):
+                row, col = self.world_to_grid_float(pose[0], pose[1])
+                d = np.hypot(rows - np.float32(row), cols - np.float32(col))
+                nearest = d if nearest is None else np.minimum(nearest, d)
+            taper = np.clip(nearest * np.float32(self.resolution / MARGIN_TAPER_M), 0.0, 1.0)
+            free = self.clearance >= (EBOT_RADIUS_M + extra_margin * taper)
 
         # The endpoints are fixed by the task. Close to them the mask allows
         # the footprint-only clearance, while preserving the added margin for
