@@ -12,7 +12,7 @@
 #                   _side_x, _reach_safe, _clamp_transit_waypoints, _start_next_ore, _target_transform_position, _refresh_pick_target,
 #                   _begin_capture_check, _call_magnet, _service_result, _held, _fault,
 #                   _at_arm_cb, _publish_cleared, _package_transform, _joint_move_toward,
-#                   _begin_sweep, _on_sweep_circle,
+#                   _begin_sweep, _on_sweep_circle, _log_fk_sample,
 #                   _start_package, _package_step, _step, main
 # Nodes:
 #                   Name - [ task3b_manipulation ]
@@ -79,11 +79,11 @@ DROP_HEIGHT_BASE = 0.04
 # This pose points the magnet's local +X face vertically down while keeping the
 # arm above the conveyor, ready for Cartesian pick-and-place motion.
 UNFOLD_POSE = (-2.0216, -2.1366, -1.5538, -1.0221, 1.5708, 1.5708)
-JOINT_SPEED_LIMIT = 0.40     # rad/s; Task 3 limit is 0.60 (was 0.20 in 2A)
-TWIST_SPEED_LIMIT = 0.20     # m/s; Task 3 limit is 0.25 (was 0.12 in 2A)
-POSITION_GAIN = 1.5          # 1/s; tail time constant 0.67 s (was 0.75 -> 1.33 s)
-ORIENTATION_GAIN = 1.5
-ANGULAR_SPEED_LIMIT = 0.3
+JOINT_SPEED_LIMIT = 0.55     # rad/s; Task 3 limit is 0.60 (2A: 0.20, 3A: 0.40)
+TWIST_SPEED_LIMIT = 0.24     # m/s; Task 3 limit is 0.25 (2A: 0.12, 3A: 0.20)
+POSITION_GAIN = 2.0          # 1/s; tail time constant 0.5 s (2A: 0.75, 3A: 1.5)
+ORIENTATION_GAIN = 2.5
+ANGULAR_SPEED_LIMIT = 0.5    # rad/s; Task 3 limit is 0.60
 ORIENTATION_TOLERANCE = math.radians(0.5)
 POSITION_TOLERANCE = 0.004
 VIA_TOLERANCE = 0.03    # m; waypoints the arm only passes through
@@ -142,7 +142,7 @@ HOPPER_STAGING = (-0.62, 0.0, PACKAGE_CARRY_Z)
 # route wound the pan to -6.2822 rad and latched CRITICAL_JOINT_LIMIT (20).
 PAN_LIMIT = 2.0 * math.pi - 0.35        # rad, stay this far inside the joint limit
 PAN_PREFERRED = -math.pi                # 2A's ore work lives around here
-SWEEP_SPEED = 0.55                      # rad/s, under the 0.60 rad/s Task 3 limit
+SWEEP_SPEED = 0.57                      # rad/s, under the 0.60 rad/s Task 3 limit
 # Ore transfers between the conveyor (-y) and the wells (+y) also go by sweep, at
 # this radius: inside the hopper's near wall (base x -0.651) when passing behind
 # the base, and far enough from the base axis that the pan rate stays low.
@@ -370,6 +370,15 @@ class Task2AManipulation(Node):
         self.drop_route_position = self._reach_safe(self.drop_route_position)
         self.drop_side_position = self._reach_safe(self.drop_side_position)
 
+    def _log_fk_sample(self, label):
+        """Joint angles with the TCP pose they produced, for checking kinematics offline."""
+        p = self.tcp_pose.position
+        o = self.tcp_pose.orientation
+        q = ', '.join(f'{a:+.5f}' for a in self.joint_angles)
+        self.get_logger().info(
+            f'FK sample {label}: q=[{q}] tcp=({p.x:+.5f}, {p.y:+.5f}, {p.z:+.5f}) '
+            f'quat=({o.x:+.5f}, {o.y:+.5f}, {o.z:+.5f}, {o.w:+.5f})')
+
     def _change_phase(self, phase):
         now = self._now_seconds()
         if phase != self.phase:
@@ -433,7 +442,11 @@ class Task2AManipulation(Node):
         x = CARGO_ROVER_WORLD[0] + WELL_LOCAL_X[kind] - ARM_BASE_WORLD[0]
         y = (CARGO_ROVER_WORLD[1] - ARM_BASE_WORLD[1]
              - WELL_LOCAL_Z[kind])
-        return (x, y, DROP_HEIGHT_BASE)
+        # The far-left (vanadinite) well's shifted drop point is near its edge: in the
+        # 3B runs the ore wedged against it on every vanadinite drop (payload force
+        # 1.5-1.7 N after release) until the nudge. Release it 3 cm higher instead.
+        extra = 0.03 if kind == 'vanadinite_ore' else 0.0
+        return (x, y, DROP_HEIGHT_BASE + extra)
 
     @staticmethod
     def _side_x(y):
@@ -1066,6 +1079,9 @@ class Task2AManipulation(Node):
             self._change_phase('move_to_pick')
             return
 
+        if self.phase == 'verify_pick' and self._now_seconds() - self.phase_started < 0.06:
+            self._log_fk_sample('pick')
+
         if self.phase == 'verify_pick':
             # Hold the pre-occlusion target while checking for payload force.
             self._refresh_pick_target()
@@ -1091,14 +1107,15 @@ class Task2AManipulation(Node):
 
         if self.phase == 'verify_capture_lift':
             target = (self.pick_position[0], self.pick_position[1],
-                      self.pick_position[2] + 0.05)
-            if self._move_toward(target):
+                      self.pick_position[2] + 0.03)
+            if self._move_toward(target, tolerance=APPROACH_TOLERANCE):
                 self._change_phase('wait_capture_check')
             return
 
         if self.phase == 'wait_capture_check':
             self._publish_twist((0.0, 0.0, 0.0))
-            if self._now_seconds() - self.phase_started < 0.6:
+            # One force-median window after stopping, so the reading is the lifted one.
+            if self._now_seconds() - self.phase_started < FORCE_WINDOW_S + 0.05:
                 return
             current_ore = self._target_transform_position()
             reference = self.capture_reference_position
@@ -1225,6 +1242,7 @@ class Task2AManipulation(Node):
             # the edge of the far well and the payload force never cleared.
             if self._move_toward(self.drop_position):
                 self.drop_nudged = False
+                self._log_fk_sample('drop')
                 self._change_phase('call_magnet_off')
             return
 
