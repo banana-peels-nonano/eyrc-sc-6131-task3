@@ -49,6 +49,10 @@ SCRIPTS = [
     'scripts/task3a/task3A_manipulation.py',
     'scripts/task3a/task3A_planning.py',
     'scripts/task3a/task3A_navigation.py',
+    'scripts/task3b/task3B_perception.py',
+    'scripts/task3b/task3B_manipulation.py',
+    'scripts/task3b/task3B_planning.py',
+    'scripts/task3b/task3B_navigation.py',
 ]
 
 setup(
