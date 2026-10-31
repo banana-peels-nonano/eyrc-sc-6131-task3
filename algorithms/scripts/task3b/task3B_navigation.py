@@ -37,9 +37,11 @@ ODOM_TOPIC = '/odom'
 CMD_TOPIC = '/cmd_vel'
 MAP_FRAME = 'map'
 
-MAX_LINEAR_MPS = 0.25      # m/s; eBot limit 0.5 (was 0.20 in 2B)
-MAX_ANGULAR_RPS = 0.80     # rad/s; eBot limit 1.0 (was 0.65 in 2B)
-LOOKAHEAD_DISTANCE_M = 0.15  # keeps the steering loop damped (zeta ~0.5) at 0.25 m/s
+MAX_LINEAR_MPS = 0.35      # m/s; eBot limit 0.5 (0.20 in 2B, 0.25 in 3A/3B-1)
+MAX_ANGULAR_RPS = 1.0      # rad/s; eBot limit 1.0 (0.65 in 2B, 0.80 in 3A/3B-1)
+# Steering loop: s^2 + 1.8 s + 1.8 v/L = 0. Damping ~0.5 needs v/L ~ 1.7:
+# 0.25/0.15 before, 0.35/0.20 now (zeta 0.51).
+LOOKAHEAD_DISTANCE_M = 0.20
 DONE_TOPIC = '/ebot_nav_done'   # ours: True once the eBot has stopped on a path's end
 
 # End of a path, 3B version. With noisy /odom (3B run 31 Oct: the reported turn

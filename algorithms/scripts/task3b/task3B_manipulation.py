@@ -12,7 +12,8 @@
 #                   _side_x, _reach_safe, _clamp_transit_waypoints, _start_next_ore, _target_transform_position, _refresh_pick_target,
 #                   _begin_capture_check, _call_magnet, _service_result, _held, _fault,
 #                   _at_arm_cb, _publish_cleared, _package_transform, _joint_move_toward,
-#                   _begin_sweep, _on_sweep_circle, _log_fk_sample,
+#                   _begin_sweep, _on_sweep_circle, _log_fk_sample, _ur_fk, _ik_tool_down,
+#                   _pan_for_heading, _begin_joint_transfer,
 #                   _start_package, _package_step, _step, main
 # Nodes:
 #                   Name - [ task3b_manipulation ]
@@ -28,6 +29,8 @@ import math
 import statistics
 import sys
 from collections import deque
+
+import numpy as np
 
 import rclpy
 import tf2_ros
@@ -152,6 +155,21 @@ SWEEP_RADIUS = 0.55
 # the rest. Batch 2 run: sweeps spent ~2 s creeping into 0.01 rad at gain 1.6.
 SWEEP_TOLERANCE = 0.03                  # rad, about 1.7 cm at SWEEP_RADIUS
 SWEEP_GAIN = 3.0                        # 1/s
+# ---- 3B speed batch 2: joint-space transfers by inverse kinematics ----------------
+# UR7e = UR5e kinematics (standard DH), TCP 0.020 m past the flange along the tool
+# axis. Checked against 8 logged (joints, /tcp_pose_raw) pairs from the 3B speed
+# run: max position error 0.42 mm.
+UR_A = (0.0, -0.425, -0.3922, 0.0, 0.0, 0.0)
+UR_D = (0.1625, 0.0, 0.0, 0.1333, 0.0997, 0.0996 + 0.020)
+UR_ALPHA = (math.pi / 2, 0.0, 0.0, math.pi / 2, -math.pi / 2, 0.0)
+# Ore transfers go from a hover above the ore to a hover above the well (or back) in
+# ONE joint move. Both hovers are tool-down at the same height, so the joint path
+# keeps the tool down and at that height throughout (checked offline for every
+# ore/well pair: TCP z constant, radius <= 0.79 m when passing behind the base).
+# Transfers from a well to the ores pass behind the base at radius up to 0.80 m,
+# i.e. over the hopper's near rim (x -0.763, z +0.207). 0.30 m keeps a carried ore
+# ~5 cm above it.
+HOVER_Z = 0.30
 # Pre-pick hover: the move after it (to the ore) is the precise one.
 APPROACH_TOLERANCE = 0.01               # m
 HOPPER_HEADING = math.pi                # the hopper is straight behind the arm
@@ -170,6 +188,51 @@ TRANSIT_REACH = 0.80
 LOOK_AWAY_HEADING = math.radians(-122.0)
 SLOW_TWIST_SPEED = 0.05         # m/s for the last move into the drop pose
 JOINT_TOLERANCE = 0.01          # rad
+
+
+def _ur_fk(q):
+    """4x4 pose of the TCP in base_link for joint angles q (6)."""
+    t = np.eye(4)
+    for i in range(6):
+        ct, st = math.cos(q[i]), math.sin(q[i])
+        ca, sa = math.cos(UR_ALPHA[i]), math.sin(UR_ALPHA[i])
+        t = t @ np.array([[ct, -st * ca, st * sa, UR_A[i] * ct],
+                          [st, ct * ca, -ct * sa, UR_A[i] * st],
+                          [0.0, sa, ca, UR_D[i]],
+                          [0.0, 0.0, 0.0, 1.0]])
+    return t
+
+
+def _ik_tool_down(point, seed):
+    """Joint angles putting the TCP at point with the tool straight down, or None.
+
+    Damped least squares on joints 1-5 from the seed (so the solution keeps the
+    seed's arm configuration); joint 6 only spins the tool about its axis and keeps
+    the seed's value. Five residuals: TCP position (3) and the tool axis's x, y.
+    """
+    target = np.array(point, dtype=float)
+    q = np.array(seed, dtype=float)
+
+    def residual(angles):
+        t = _ur_fk(angles)
+        return np.r_[t[:3, 3] - target, t[0, 2], t[1, 2]]
+
+    for _ in range(60):
+        r = residual(q)
+        if np.linalg.norm(r) < 1e-7:
+            break
+        jac = np.zeros((5, 5))
+        for j in range(5):
+            dq = np.zeros(6)
+            dq[j] = 1e-6
+            jac[:, j] = (residual(q + dq) - r) / 1e-6
+        q[:5] += np.linalg.solve(jac.T @ jac + 1e-4 * np.eye(5), -jac.T @ r)
+    t = _ur_fk(q)
+    if (np.linalg.norm(t[:3, 3] - target) > 1e-4 or t[2, 2] > -0.999
+            or np.any(np.abs(q) > 2.0 * math.pi - 0.1)
+            or np.any(np.abs(q[1:5] - np.array(seed[1:5])) > 1.6)):
+        return None
+    return [float(v) for v in q]
 
 
 class Task2AManipulation(Node):
@@ -252,6 +315,7 @@ class Task2AManipulation(Node):
         self.package_tries = 0
         self.package_wait_logged = False
         self.drop_nudged = False
+        self.xfer_tried_at = None
         self.package_look_logged = False
         self.package_find_started = 0.0
         self.package_looked_away = False
@@ -703,15 +767,8 @@ class Task2AManipulation(Node):
         heading, take the one inside the joint limit nearest the current pan
         (ties go to the one nearer PAN_PREFERRED).
         """
-        p = self._position()
-        current_heading = math.atan2(p[1], p[0])
         pan = self.joint_angles[0]
-        delta = math.atan2(math.sin(heading - current_heading),
-                           math.cos(heading - current_heading))
-        candidates = [pan + delta + k * 2.0 * math.pi for k in (-1, 0, 1)]
-        candidates = [c for c in candidates if abs(c) <= PAN_LIMIT]
-        target_pan = min(candidates, key=lambda c: (
-            abs(c - pan) + 0.01 * abs(c - PAN_PREFERRED)))
+        target_pan = self._pan_for_heading(heading)
         self.sweep_joints = [target_pan] + list(self.joint_angles[1:])
         self.sweep_next = next_phase
         self.get_logger().info(
@@ -724,6 +781,37 @@ class Task2AManipulation(Node):
         p = self._position()
         heading = math.atan2(p[1], p[0])
         return (SWEEP_RADIUS * math.cos(heading), SWEEP_RADIUS * math.sin(heading), p[2])
+
+    def _pan_for_heading(self, heading):
+        """Pan angle turning the TCP to heading: inside the joint limit, nearest the
+        current pan (ties to the one nearer PAN_PREFERRED)."""
+        p = self._position()
+        current_heading = math.atan2(p[1], p[0])
+        pan = self.joint_angles[0]
+        delta = math.atan2(math.sin(heading - current_heading),
+                           math.cos(heading - current_heading))
+        candidates = [pan + delta + k * 2.0 * math.pi for k in (-1, 0, 1)]
+        candidates = [c for c in candidates if abs(c) <= PAN_LIMIT]
+        return min(candidates, key=lambda c: (
+            abs(c - pan) + 0.01 * abs(c - PAN_PREFERRED)))
+
+    def _begin_joint_transfer(self, point, next_phase):
+        """One joint move to a tool-down point (via the sweep phases). False if IK fails."""
+        seed = [self._pan_for_heading(math.atan2(point[1], point[0]))]
+        seed += list(self.joint_angles[1:])
+        q = _ik_tool_down(point, seed)
+        if q is None:
+            self.get_logger().warning(
+                f'IK found no tool-down solution for ({point[0]:.3f}, {point[1]:.3f}, '
+                f'{point[2]:.3f}); using the radial route.')
+            return False
+        self.sweep_joints = q
+        self.sweep_next = next_phase
+        self.get_logger().info(
+            f'Joint transfer to ({point[0]:.3f}, {point[1]:.3f}, {point[2]:.3f}), '
+            f'pan {self.joint_angles[0]:+.2f} -> {q[0]:+.2f} rad.')
+        self._change_phase('pkg_sweep_start')
+        return True
 
     def _start_package(self):
         self.package_target = None
@@ -1015,8 +1103,19 @@ class Task2AManipulation(Node):
             return
 
         if self.phase == 'transit_to_pick':
-            # Radially to SWEEP_RADIUS on the current heading, then sweep the pan
-            # round to the ore's heading.
+            # One joint move to the hover above the ore. The target is locked now,
+            # while the camera sees the ore clearly with the arm away.
+            if self.xfer_tried_at != self.phase_started:
+                self.xfer_tried_at = self.phase_started
+                self._refresh_pick_target()
+                # Empty arm: hover at the height it is at now (>= CARRY_CLEARANCE), so
+                # the transfer is level; HOVER_Z is for carrying an ore over the rim.
+                hover = self._reach_safe(self.pick_transit_position)
+                self.pick_target_locked = True
+                if self._begin_joint_transfer(hover, 'approach_pick'):
+                    return
+                self.pick_target_locked = False
+            # Fallback: radially to SWEEP_RADIUS, then sweep the pan round.
             if self._move_toward(self._on_sweep_circle(), tolerance=VIA_TOLERANCE):
                 self._refresh_pick_target()
                 self._begin_sweep(
@@ -1213,14 +1312,20 @@ class Task2AManipulation(Node):
             # Up and inwards together, straight onto the sweep circle: straight up
             # from a far ore runs into full stretch, and a separate move in to the
             # circle cost 1.3-7.1 s per ore in the batch 2 run.
-            heading = math.atan2(self.pick_position[1], self.pick_position[0])
-            target = (SWEEP_RADIUS * math.cos(heading), SWEEP_RADIUS * math.sin(heading),
-                      self.transit_position[2])
+            target = self._reach_safe((self.pick_position[0], self.pick_position[1],
+                                       max(HOVER_Z, self.transit_position[2])))
             if self._move_toward(target, tolerance=VIA_TOLERANCE):
                 self._change_phase('transit_to_drop_route')
             return
 
         if self.phase == 'transit_to_drop_route':
+            if self.xfer_tried_at != self.phase_started:
+                self.xfer_tried_at = self.phase_started
+                hover = self._reach_safe((self.drop_position[0], self.drop_position[1],
+                                          max(HOVER_Z, self.transit_position[2])))
+                if self._begin_joint_transfer(hover, 'approach_drop'):
+                    return
+            # Fallback: radially to SWEEP_RADIUS, then sweep the pan round.
             if self._move_toward(self._on_sweep_circle(), tolerance=VIA_TOLERANCE):
                 self._begin_sweep(
                     math.atan2(self.drop_position[1], self.drop_position[0]),
