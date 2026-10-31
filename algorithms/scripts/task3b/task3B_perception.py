@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Detect the Task 3A ores and the ore package, and publish them as transforms in ``base_link``."""
+"""Detect the Task 3B ores and the ore package, and publish them as transforms in ``base_link``."""
 
 # Team ID:          [6131]
 # Author List:      [Agrim Chauhan, Saksham Kaushal, Rayhan Khan, Manan Sood]
-# Filename:         task3A_perception.py
-# Task:             3A - StrataCobot (eYRC 2026-27)
+# Filename:         task3B_perception.py
+# Task:             3B - StrataCobot (eYRC 2026-27)
 # Functions:
 #                   _rotate_points, __init__, _color_cb, _depth_cb, _info_cb, _find_regions,
 #                   _point_in_base, _base_points, _assign_ids, _at_arm_cb, _cleared_cb, _find_package,
 #                   _process, main
 # Nodes:
-#                   Name - [ task3a_perception ]
+#                   Name - [ task3b_perception ]
 #                   Publishing Topics - [ /tf ]
 #                   Subscribing Topics - [ /camera/camera/color/image_raw,
 #                       /camera/camera/aligned_depth_to_color/image_raw,
@@ -58,7 +58,7 @@ PACKAGE_MIN_AREA_PX = 60.0
 # Where the deck of an eBot parked beside the arm can be, in base_link (m).
 # Measured 28 Oct: top face centre at (0.651, 0.091, 0.255).
 PACKAGE_ROI = ((0.25, 1.05), (-0.45, 0.45), (0.10, 0.45))
-# Handover topics (latched), shared with task3A_planning / task3A_manipulation.
+# Handover topics (latched), shared with task3B_planning / task3B_manipulation.
 AT_ARM_TOPIC = '/ebot_at_arm'
 CLEARED_TOPIC = '/package_cleared'
 
@@ -79,7 +79,7 @@ def _rotate_points(points, quaternion):
 class OrePerception(Node):
     def __init__(self):
         super().__init__(
-            'task3a_perception',
+            'task3b_perception',
             parameter_overrides=[rclpy.parameter.Parameter(
                 'use_sim_time', rclpy.Parameter.Type.BOOL, True)],
         )
@@ -117,7 +117,7 @@ class OrePerception(Node):
         self.create_subscription(
             CameraInfo, CAMERA_INFO_TOPIC, self._info_cb, qos_profile_sensor_data)
         self.create_timer(0.15, self._process)
-        self.get_logger().info('Task 3A perception ready; waiting for camera data.')
+        self.get_logger().info('Task 3B perception ready; waiting for camera data.')
 
     def _color_cb(self, msg):
         self.color_msg = msg

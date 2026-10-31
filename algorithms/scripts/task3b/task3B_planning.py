@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
-"""Plan and publish the three Task 3A eBot legs and run the eBot side of the handover."""
+"""Plan and publish the three Task 3B eBot legs and run the eBot side of the handover."""
 
 # Team ID:          [6131]
 # Author List:      [Agrim Chauhan, Saksham Kaushal, Rayhan Khan, Manan Sood]
-# Filename:         task3A_planning.py
-# Task:             3A - StrataCobot (eYRC 2026-27)
+# Filename:         task3B_planning.py
+# Task:             3B - StrataCobot (eYRC 2026-27)
 # Functions:
 #                   _wrap_angle, _quaternion_yaw, __init__, mapcb, odomcb, world_to_grid_float,
 #                   world_to_cell, grid_to_world, _relaxed_endpoint_cells, _make_free_mask,
 #                   _heuristic, _astar, _any_angle_path, point, endpoint_links, neighbors,
 #                   _line_is_free, clear, endpoint_clear, _smooth_cells, _optimize_path_anchors,
 #                   improve_anchor, _append_if_distinct, _tighten_path, _resample_path, plan_path,
-#                   publish_path, _is_stopped, _near_pose, _at_start_and_stopped,
+#                   publish_path, navdonecb, _is_stopped, _near_pose, _at_start_and_stopped,
 #                   _request_ore_package, clearedcb, _announce_at_arm, _advance_step,
 #                   process_planning, main
 # Nodes:
-#                   Name - [ ebot_planner_node ]
+#                   Name - [ task3b_planner ]
 #                   Publishing Topics - [ /ebot_path, /ebot_at_arm ]
-#                   Subscribing Topics - [ /map, /odom, /package_cleared, /clock ]
+#                   Subscribing Topics - [ /map, /odom, /package_cleared, /ebot_nav_done,
+#                       /clock ]
 #                   Service Clients - [ /spawn_ore_package ]
 
 ################### IMPORT MODULES #######################
@@ -37,7 +38,7 @@ from rclpy.qos import (
     QoSProfile,
     QoSReliabilityPolicy,
 )
-from scipy.ndimage import distance_transform_edt, maximum_filter1d
+from scipy.ndimage import distance_transform_edt, label, maximum_filter1d
 from std_msgs.msg import Bool
 from std_srvs.srv import Trigger
 
@@ -46,11 +47,14 @@ MAP_TOPIC = '/map'
 PATH_TOPIC = '/ebot_path'
 ODOM_TOPIC = '/odom'
 SPAWN_SERVICE = '/spawn_ore_package'
-# Handover with task3A_manipulation.py (our own interface, both latched):
+# Handover with task3B_manipulation.py (our own interface, both latched):
 #   /ebot_at_arm      True while the eBot is parked beside the arm with the package
 #   /package_cleared  True once the arm has lifted the package off the deck
 AT_ARM_TOPIC = '/ebot_at_arm'
 CLEARED_TOPIC = '/package_cleared'
+# From task3B_navigation (latched): True once the eBot has stopped on a path's end.
+# Replaces judging "stopped" from /odom speeds, which in 3B are too noisy for it.
+NAV_DONE_TOPIC = '/ebot_nav_done'
 MAP_FRAME = 'map'
 
 HOME_POSE = (0.0, 0.0, 0.0)
@@ -68,11 +72,12 @@ STEPS = (
 # The collision boxes in the eBot description are 0.62 x 0.49 m. A 5 mm
 # raster allowance compensates for discretization around the circle footprint.
 EBOT_RADIUS_M = math.hypot(0.62 / 2.0, 0.49 / 2.0) - 0.005
-CLEARANCE_MARGINS = (0.10, 0.05, 0.0)
+# 3B: rocks stand up to ~0.17 m from where /map shows them (map_check, 31 Oct:
+# mean 0.127 m, max 0.173 m, blob centroid to model origin). Try generous margins
+# first; a quick connectivity test skips the ones with no way through.
+CLEARANCE_MARGINS = (0.25, 0.20, 0.15, 0.10, 0.05, 0.0)
 ENDPOINT_RELAX_RADIUS_M = 0.18
 PATH_SAMPLE_SPACING_M = 0.06
-STILL_LINEAR_MPS = 0.02
-STILL_ANGULAR_RPS = 0.02
 
 
 def _wrap_angle(angle):
@@ -91,7 +96,7 @@ class EbotPlanner(Node):
 
     def __init__(self):
         super().__init__(
-            'task3a_planner',
+            'task3b_planner',
             parameter_overrides=[rclpy.parameter.Parameter(
                 'use_sim_time', rclpy.Parameter.Type.BOOL, True)],
         )
@@ -110,6 +115,9 @@ class EbotPlanner(Node):
         self.at_arm_pub = self.create_publisher(Bool, AT_ARM_TOPIC, latched_qos)
         self.cleared_sub = self.create_subscription(
             Bool, CLEARED_TOPIC, self.clearedcb, latched_qos)
+        self.nav_done = False
+        self.nav_done_sub = self.create_subscription(
+            Bool, NAV_DONE_TOPIC, self.navdonecb, latched_qos)
         self.spawn_client = self.create_client(Trigger, SPAWN_SERVICE)
 
         self.grid = None
@@ -137,7 +145,7 @@ class EbotPlanner(Node):
         self.run_complete_logged = False
 
         self.create_timer(0.1, self.process_planning)
-        self.get_logger().info('Task 3A planner ready; waiting for /map and /odom.')
+        self.get_logger().info('Task 3B planner ready; waiting for /map and /odom.')
 
     def mapcb(self, data):
         if self.grid is not None:
@@ -692,6 +700,14 @@ class EbotPlanner(Node):
 
         for extra_margin in CLEARANCE_MARGINS:
             free = self._make_free_mask(start, end, extra_margin)
+            # Skip margins with no way through at all, cheaply, before searching.
+            components, _ = label(free)
+            if not (0 <= start_cell[0] < free.shape[0] and 0 <= start_cell[1] < free.shape[1]
+                    and 0 <= end_cell[0] < free.shape[0] and 0 <= end_cell[1] < free.shape[1]):
+                return None
+            start_label = components[start_cell]
+            if start_label == 0 or start_label != components[end_cell]:
+                continue
             if self._line_is_free(start[:2], end[:2], free):
                 self.selected_margin = extra_margin
                 return self._resample_path([start[:2], end[:2]], free)
@@ -770,12 +786,12 @@ class EbotPlanner(Node):
 
         self.path_pub.publish(path)
 
+    def navdonecb(self, data):
+        self.nav_done = bool(data.data)
+
     def _is_stopped(self):
-        return (
-            self.odom is not None
-            and self.odom[3] < STILL_LINEAR_MPS
-            and self.odom[4] < STILL_ANGULAR_RPS
-        )
+        # Navigation reports when it has stopped on a path's end and commands zero.
+        return self.nav_done
 
     def _near_pose(self, target, position_tolerance, yaw_tolerance):
         if self.odom is None:
@@ -791,8 +807,9 @@ class EbotPlanner(Node):
             return False
         x, y = self.odom[:2]
         return (
-            math.hypot(start[0] - x, start[1] - y) <= 0.20
-            and self._is_stopped()
+            math.hypot(start[0] - x, start[1] - y) <= 0.25
+            # At home before the first leg the eBot has never moved.
+            and (self.step == 0 or self._is_stopped())
         )
 
     def _request_ore_package(self):
@@ -860,7 +877,7 @@ class EbotPlanner(Node):
         self.path_published = False
         self.path_error_reported = False
         self.end_stable_count = 0
-        self.get_logger().info(f'Task 3A step {completed} complete.')
+        self.get_logger().info(f'Task 3B step {completed} complete.')
 
     def process_planning(self):
         if self.grid is None or self.clearance is None or self.odom is None:
@@ -902,7 +919,7 @@ class EbotPlanner(Node):
             return
 
         arrived = (
-            self._near_pose(end, position_tolerance=0.20, yaw_tolerance=0.12)
+            self._near_pose(end, position_tolerance=0.25, yaw_tolerance=0.25)
             and self._is_stopped()
         )
         if arrived:

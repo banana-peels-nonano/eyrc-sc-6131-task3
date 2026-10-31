@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Task 3A arm: sort the ores (as in 2A) and move the ore package from the eBot to the crusher."""
+"""Task 3B arm: sort the ores (as in 2A) and move the ore package from the eBot to the crusher."""
 
 # Team ID:          [6131]
 # Author List:      [Agrim Chauhan, Saksham Kaushal, Rayhan Khan, Manan Sood]
-# Filename:         task3A_manipulation.py
-# Task:             3A - StrataCobot (eYRC 2026-27)
+# Filename:         task3B_manipulation.py
+# Task:             3B - StrataCobot (eYRC 2026-27)
 # Functions:
 #                   __init__, _now_seconds, _tcp_cb, _joints_cb, _status_cb, _force_cb, _position,
 #                   _tool_alignment, _publish_twist, _publish_joints, _stop, _move_toward,
@@ -15,7 +15,7 @@
 #                   _begin_sweep, _on_sweep_circle,
 #                   _start_package, _package_step, _step, main
 # Nodes:
-#                   Name - [ task3a_manipulation ]
+#                   Name - [ task3b_manipulation ]
 #                   Publishing Topics - [ /delta_twist_cmds, /delta_joint_cmds, /package_cleared ]
 #                   Subscribing Topics - [ /tcp_pose_raw, /joint_states, /arm_status,
 #                       /ur7e/end_effector/force_magnitude, /ebot_at_arm, /tf, /tf_static,
@@ -25,7 +25,9 @@
 ################### IMPORT MODULES #######################
 
 import math
+import statistics
 import sys
+from collections import deque
 
 import rclpy
 import tf2_ros
@@ -86,7 +88,16 @@ ORIENTATION_TOLERANCE = math.radians(0.5)
 POSITION_TOLERANCE = 0.004
 VIA_TOLERANCE = 0.03    # m; waypoints the arm only passes through
 PICK_POSITION_TOLERANCE = 0.0005
-FORCE_HELD_THRESHOLD_N = 0.50
+# 3B: /ur7e/end_effector/force_magnitude carries noise of up to ~0.56 N with nothing
+# held (3B run 31 Oct; mean ~0.29 N), so the 2A threshold of 0.5 N on raw readings
+# "confirmed" pickups that had not happened. The reading is now the median of the
+# last FORCE_WINDOW_S, judged against 0.9 N (an ore reads ~1.46 N, the package ~2.94).
+FORCE_HELD_THRESHOLD_N = 0.90
+FORCE_WINDOW_S = 0.4
+# 3B: depth noise biases the camera's ore-top height upwards (3B: -0.057 m; 3A,
+# noise-free: -0.063 m, every ore), so the magnet stopped ~6 mm short and never
+# latched. The ores all sit on the fixed conveyor and share one height: use it.
+ORE_TOP_Z = -0.063
 FORCE_APPROACH_LIMIT_N = 15.0
 TF_MAX_AGE_S = 0.8
 EXPECTED_ORE_COUNT = 4
@@ -103,8 +114,8 @@ PICK_XY_SEARCH_OFFSETS = (
 )
 FORCE_COLLISION_THRESHOLD_N = 5.0
 
-# ---- Task 3A: the ore package ---------------------------------------------------
-# Handover topics (latched), shared with task3A_planning and task3A_perception.
+# ---- Task 3B: the ore package ---------------------------------------------------
+# Handover topics (latched), shared with task3B_planning and task3B_perception.
 AT_ARM_TOPIC = '/ebot_at_arm'
 CLEARED_TOPIC = '/package_cleared'
 PACKAGE_FRAME = 'ore_package'
@@ -164,7 +175,7 @@ JOINT_TOLERANCE = 0.01          # rad
 class Task2AManipulation(Node):
     def __init__(self):
         super().__init__(
-            'task3a_manipulation',
+            'task3b_manipulation',
             parameter_overrides=[rclpy.parameter.Parameter(
                 'use_sim_time', rclpy.Parameter.Type.BOOL, True)],
         )
@@ -199,6 +210,7 @@ class Task2AManipulation(Node):
         self.joint_angles = None
         self.arm_status = None
         self.force_n = None
+        self.force_samples = deque()
         self.force_time = None
         self.force_log_time = 0.0
         self.switch_future = None
@@ -230,7 +242,7 @@ class Task2AManipulation(Node):
         self.sorted_ores = set()
         self.failed_ores = set()
         self.fault_logged = False
-        # Task 3A package job
+        # Task 3B package job
         self.tool_axis_target = (0.0, 0.0, -1.0)
         self.switch_target = None
         self.ebot_at_arm = False
@@ -249,7 +261,7 @@ class Task2AManipulation(Node):
         self.package_phase_after_switch = None
         self.timer = self.create_timer(0.05, self._step)
         self.get_logger().info(
-            'Task 3A manipulation ready; waiting for arm feedback and ore transforms.')
+            'Task 3B manipulation ready; waiting for arm feedback and ore transforms.')
 
     def _now_seconds(self):
         return self.get_clock().now().nanoseconds / 1e9
@@ -266,8 +278,12 @@ class Task2AManipulation(Node):
         self.arm_status = int(msg.data)
 
     def _force_cb(self, msg):
-        self.force_n = abs(float(msg.data))
-        self.force_time = self._now_seconds()
+        now = self._now_seconds()
+        self.force_samples.append((now, abs(float(msg.data))))
+        while self.force_samples and now - self.force_samples[0][0] > FORCE_WINDOW_S:
+            self.force_samples.popleft()
+        self.force_n = statistics.median(f for _, f in self.force_samples)
+        self.force_time = now
 
     def _position(self):
         p = self.tcp_pose.position
@@ -456,8 +472,8 @@ class Task2AManipulation(Node):
             key=lambda item: math.dist(current, item[2]),
         )
         self.target_name = frame
-        self.ore_position = tuple(float(v) for v in position)
-        self.pick_surface_z = self.ore_position[2]
+        self.ore_position = (float(position[0]), float(position[1]), ORE_TOP_Z)
+        self.pick_surface_z = ORE_TOP_Z
         self.pick_target_locked = False
         # The ore TF is on the top face. The spring-mounted magnet needs a small
         # stand-off so its face contacts the surface without driving into it.
@@ -620,7 +636,7 @@ class Task2AManipulation(Node):
                 self.get_logger().error(message)
         self._change_phase('fault')
 
-    # ---- Task 3A: the ore package ---------------------------------------------------
+    # ---- Task 3B: the ore package ---------------------------------------------------
 
     def _at_arm_cb(self, msg):
         if msg.data and not self.ebot_at_arm:
