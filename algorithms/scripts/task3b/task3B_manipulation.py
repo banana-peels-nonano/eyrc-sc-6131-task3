@@ -147,6 +147,8 @@ HOPPER_STAGING = (-0.62, 0.0, PACKAGE_CARRY_Z)
 # by the short way round (batch 2 run: 4.46 rad the long way, 8.3 s).
 PAN_LIMIT = 2.0 * math.pi - 0.25        # rad, stay this far inside the joint limit
 PAN_PREFERRED = -math.pi                # 2A's ore work lives around here
+# Headings within this of straight ahead belong to the parked eBot and its package.
+FRONT_SECTOR_RAD = math.radians(35.0)
 SWEEP_SPEED = 0.57                      # rad/s, under the 0.60 rad/s Task 3 limit
 # Ore transfers between the conveyor (-y) and the wells (+y) also go by sweep, at
 # this radius: inside the hopper's near wall (base x -0.651) when passing behind
@@ -179,7 +181,8 @@ PACKAGE_HOVER = 0.06            # m above the top face: where the joint move end
 # the cargo rover. Back to the proven carry (0.42, tool down, constant radius: the
 # same pure base-joint swing as 3A/3B-s2); only the final tilt-and-reach, which was
 # a 2.3 s tilt plus a 6 s crawl at 0.05 m/s, becomes one slow joint move.
-PACKAGE_REACH_SPEED = 0.25      # rad/s for staging -> tilted release (largest joint 0.76 rad)
+PACKAGE_REACH_SPEED = 0.35      # rad/s for staging -> tilted release (largest joint 0.76 rad;
+                                # 0.25 in batch 3b: 3.5 s, package held fine)
 HOPPER_EXIT = (-0.60, 0.0, HOVER_Z)   # tool-down pose the arm leaves the hopper to
 # Pre-pick hover: the move after it (to the ore) is the precise one.
 APPROACH_TOLERANCE = 0.01               # m
@@ -803,7 +806,8 @@ class Task2AManipulation(Node):
         return (SWEEP_RADIUS * math.cos(heading), SWEEP_RADIUS * math.sin(heading), p[2])
 
     def _pan_for_heading(self, heading):
-        """Pan angle turning the TCP to heading: inside the joint limit, nearest the
+        """Pan angle turning the TCP to heading: inside the joint limit, not swinging
+        through the front sector (unless starting or ending there), nearest the
         current pan (ties to the one nearer PAN_PREFERRED)."""
         p = self._position()
         current_heading = math.atan2(p[1], p[0])
@@ -812,8 +816,29 @@ class Task2AManipulation(Node):
                            math.cos(heading - current_heading))
         candidates = [pan + delta + k * 2.0 * math.pi for k in (-1, 0, 1)]
         candidates = [c for c in candidates if abs(c) <= PAN_LIMIT]
+        # The parked eBot and its package sit in front of the arm (heading ~0, top
+        # face z 0.256). Evaluated run, 2 Nov: azurite_ore_2 at heading -82 deg was
+        # carried to its well (+91 deg) the short way, through the front, at TCP
+        # z 0.30, and knocked the package off the deck. Ore and well headings are
+        # all >= 83 deg from the front, so for them only the way round the back is
+        # allowed; moves that start or end at the package are unaffected.
+        if (abs(current_heading) > FRONT_SECTOR_RAD
+                and abs(math.atan2(math.sin(heading), math.cos(heading))) > FRONT_SECTOR_RAD):
+            back = [c for c in candidates
+                    if not self._sweep_crosses_front(current_heading, c - pan)]
+            if back:
+                candidates = back
+            else:
+                self.get_logger().warning('No pan choice avoids the front sector.')
         return min(candidates, key=lambda c: (
             abs(c - pan) + 0.01 * abs(c - PAN_PREFERRED)))
+
+    @staticmethod
+    def _sweep_crosses_front(start_heading, sweep):
+        """True if turning the TCP from start_heading by sweep (rad) passes heading 0."""
+        lo, hi = sorted((start_heading, start_heading + sweep))
+        k = math.ceil(lo / (2.0 * math.pi))
+        return k * 2.0 * math.pi <= hi
 
     def _begin_joint_transfer(self, point, next_phase, axis=(0.0, 0.0, -1.0)):
         """One joint move to a point with the tool along axis (via the sweep phases).
@@ -844,11 +869,34 @@ class Task2AManipulation(Node):
         self.tool_axis_target = (0.0, 0.0, -1.0)
         self.staging_joints = None
         self.get_logger().info('Starting the package job.')
-        self._change_phase('pkg_rise')
+        self._change_phase('pkg_check_empty')
 
     def _package_step(self):
         phase = self.phase
         now = self._now_seconds()
+
+        if phase == 'pkg_check_empty':
+            # At rest for one force window: anything still on the magnet would be
+            # carried into the package pick. Switch it off (over the last well, or
+            # where the arm stopped) before going on.
+            self._publish_twist((0.0, 0.0, 0.0))
+            if now - self.phase_started < FORCE_WINDOW_S + 0.05:
+                return
+            if self._held():
+                self.get_logger().warning(
+                    f'Payload force {self.force_n:.2f} N at rest before the package job; '
+                    'switching the magnet off.')
+                self._call_magnet(False, 'pkg_wait_empty')
+                return
+            self._change_phase('pkg_rise')
+            return
+
+        if phase == 'pkg_wait_empty':
+            self._publish_twist((0.0, 0.0, 0.0))
+            if self._service_result() is None:
+                return
+            self._change_phase('pkg_rise')
+            return
 
         if phase == 'pkg_rise':
             # Up to transfer height first, clear of the conveyor and the wells.
@@ -1136,18 +1184,20 @@ class Task2AManipulation(Node):
             errors = [target - current for target, current
                       in zip(UNFOLD_POSE, self.joint_angles)]
             largest = max(abs(value) for value in errors)
-            if largest < 0.015:
+            if largest < SWEEP_TOLERANCE:
                 self._publish_joints((0.0,) * 6)
                 self._change_phase('settle')
                 return
-            speed = min(JOINT_SPEED_LIMIT, 1.6 * largest)
+            # Batch 4: sweep speed and gain (the 1.6 gain spent ~2 s on the last 0.3 rad);
+            # the first move after this is a joint transfer, so 0.03 rad is enough.
+            speed = min(SWEEP_SPEED, SWEEP_GAIN * largest)
             self._publish_joints([
                 (error / largest) * speed for error in errors])
             return
 
         if self.phase == 'settle':
             self._publish_joints((0.0,) * 6)
-            if self._now_seconds() - self.phase_started >= 0.6:
+            if self._now_seconds() - self.phase_started >= 0.2:
                 if not self._switch(TWIST_CONTROLLER, JOINT_CONTROLLER, 'select'):
                     self._publish_twist((0.0, 0.0, 0.0))
             return
@@ -1168,6 +1218,11 @@ class Task2AManipulation(Node):
         if self.phase == 'prepare_pick':
             self._refresh_pick_target()
             current = self._position()
+            if current[2] >= CARRY_CLEARANCE - 0.01:
+                # Already at transfer height (after a retreat or the package job): the
+                # joint transfer starts from here. This move cost 0.8-1.5 s per ore.
+                self._change_phase('transit_to_pick')
+                return
             safe_z = max(current[2], self.pick_transit_position[2])
             if self._move_toward(self._reach_safe((current[0], current[1], safe_z)), tolerance=VIA_TOLERANCE):
                 self._change_phase('transit_to_pick')
@@ -1473,6 +1528,10 @@ class Task2AManipulation(Node):
 
         if self.phase == 'retreat':
             if self._move_toward(self.transit_position, tolerance=VIA_TOLERANCE):
+                # Batch 4 checked the payload force here: it read ~20 N every time, as
+                # the arm was still decelerating. The force reading is only a load
+                # measurement with the arm at rest; the empty-tool check now happens
+                # once, at rest, before the package job (pkg_check_empty).
                 self._change_phase('select')
             return
 
