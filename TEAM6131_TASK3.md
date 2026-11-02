@@ -11,7 +11,7 @@ packages and evaluator binary.
 | Subtask | State | Best result |
 |---|---|---|
 | 3A | Recorded and packaged, 31 Oct 2026 | **27.81 / 30**. Run score 46.35 / 50: detected 5/5, dropped 5/5, eBot legs 2/2, bonus, T = 182.4 s |
-| 3B | Not started | — |
+| 3B | Recorded and packaged, 2 Nov 2026 | **47.99 / 50**. Both runs: detected 5/5, dropped 5/5, eBot legs 2/2, bonus; T = 97–100 s |
 | 3C (viva) | Opens 10 Nov; last Start 16 Nov 20:44 | — |
 
 Every evaluated 3A run (all with full detection, drops, legs and bonus; only the time changed):
@@ -84,3 +84,18 @@ ros2 run algorithms task3A_navigation.py
   - rim z +0.207
 - **Reach test** (TCP at z 0.33): the singularity warning starts at x = −0.869 / −0.917 / −0.944 / −0.960 for tool tilts of 0 / 20 / 35 / 50°.
 - **In 3A, `/odom` equals ground truth.** 3B adds sensor noise, and its `/map` may not match the world.
+
+## Task 3B submission (2 Nov 2026)
+
+- Recorded result: **47.99 / 50** (unrecorded best with the same code: 48.03)
+- Submitted code: git tag `3b-final-47.99` (same code as `3b-perc-guard`)
+- Package: `SC#6131_task3B.zip` = signed `result.zip` + the four `task3B_*.py`
+- Video (unlisted): https://www.youtube.com/watch?v=CefhoqSfeg8
+
+| Version (git tag) | What changed | Evaluated |
+|---|---|---|
+| 3B attempt 1 | 3A logic + 3B noise fixes | 46.29 recorded |
+| `3b-speed-2` | Own UR5e inverse kinematics: each ore transfer is one joint move; eBot 0.35 m/s | - |
+| `3b-speed-3b` | Package fetched and delivered by joint moves; higher gains | - |
+| `3b-speed-5` | Ore moves never swing across the parked eBot | 44.87 (one detection missed in run 1) |
+| `3b-perc-guard` | Package TF holds its full view when partly hidden; ore TF height clamped | 48.03 unrecorded, **47.99 recorded** |
