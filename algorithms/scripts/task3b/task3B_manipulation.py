@@ -13,7 +13,7 @@
 #                   _begin_capture_check, _call_magnet, _service_result, _held, _fault,
 #                   _at_arm_cb, _publish_cleared, _package_transform, _joint_move_toward,
 #                   _begin_sweep, _on_sweep_circle, _log_fk_sample, _ur_fk, _ik_tool_down,
-#                   _pan_for_heading, _begin_joint_transfer,
+#                   _pan_for_heading, _begin_joint_transfer, _ik_tool_axis,
 #                   _start_package, _package_step, _step, main
 # Nodes:
 #                   Name - [ task3b_manipulation ]
@@ -84,7 +84,7 @@ DROP_HEIGHT_BASE = 0.04
 UNFOLD_POSE = (-2.0216, -2.1366, -1.5538, -1.0221, 1.5708, 1.5708)
 JOINT_SPEED_LIMIT = 0.55     # rad/s; Task 3 limit is 0.60 (2A: 0.20, 3A: 0.40)
 TWIST_SPEED_LIMIT = 0.24     # m/s; Task 3 limit is 0.25 (2A: 0.12, 3A: 0.20)
-POSITION_GAIN = 2.0          # 1/s; tail time constant 0.5 s (2A: 0.75, 3A: 1.5)
+POSITION_GAIN = 3.5          # 1/s; tail time constant 0.29 s (2A: 0.75, 3A: 1.5, 3B-s1: 2.0)
 ORIENTATION_GAIN = 2.5
 ANGULAR_SPEED_LIMIT = 0.5    # rad/s; Task 3 limit is 0.60
 ORIENTATION_TOLERANCE = math.radians(0.5)
@@ -143,7 +143,9 @@ HOPPER_STAGING = (-0.62, 0.0, PACKAGE_CARRY_Z)
 # then circles the base at constant radius and height, and we choose which way
 # round so the pan joint stays inside its +-2 pi limit. Run 29 Oct: a Cartesian
 # route wound the pan to -6.2822 rad and latched CRITICAL_JOINT_LIMIT (20).
-PAN_LIMIT = 2.0 * math.pi - 0.35        # rad, stay this far inside the joint limit
+# 3B batch 3: 0.35 -> 0.25 so the package (pan ~ -5.95 after a well drop) is reached
+# by the short way round (batch 2 run: 4.46 rad the long way, 8.3 s).
+PAN_LIMIT = 2.0 * math.pi - 0.25        # rad, stay this far inside the joint limit
 PAN_PREFERRED = -math.pi                # 2A's ore work lives around here
 SWEEP_SPEED = 0.57                      # rad/s, under the 0.60 rad/s Task 3 limit
 # Ore transfers between the conveyor (-y) and the wells (+y) also go by sweep, at
@@ -154,7 +156,7 @@ SWEEP_RADIUS = 0.55
 # A sweep only has to land near its heading: the Cartesian move after it absorbs
 # the rest. Batch 2 run: sweeps spent ~2 s creeping into 0.01 rad at gain 1.6.
 SWEEP_TOLERANCE = 0.03                  # rad, about 1.7 cm at SWEEP_RADIUS
-SWEEP_GAIN = 3.0                        # 1/s
+SWEEP_GAIN = 4.5                        # 1/s (3.0 before batch 3)
 # ---- 3B speed batch 2: joint-space transfers by inverse kinematics ----------------
 # UR7e = UR5e kinematics (standard DH), TCP 0.020 m past the flange along the tool
 # axis. Checked against 8 logged (joints, /tcp_pose_raw) pairs from the 3B speed
@@ -170,6 +172,15 @@ UR_ALPHA = (math.pi / 2, 0.0, 0.0, math.pi / 2, -math.pi / 2, 0.0)
 # i.e. over the hopper's near rim (x -0.763, z +0.207). 0.30 m keeps a carried ore
 # ~5 cm above it.
 HOVER_Z = 0.30
+# Package job, batch 3: joint moves instead of rise + sweep + Cartesian legs.
+PACKAGE_HOVER = 0.06            # m above the top face: where the joint move ends
+# Batch 3 first try carried the package to the hopper in ONE joint move from 10 cm
+# above the deck (bottom ~0.28, tilting on the way): it fell off ~1.5 s in, beside
+# the cargo rover. Back to the proven carry (0.42, tool down, constant radius: the
+# same pure base-joint swing as 3A/3B-s2); only the final tilt-and-reach, which was
+# a 2.3 s tilt plus a 6 s crawl at 0.05 m/s, becomes one slow joint move.
+PACKAGE_REACH_SPEED = 0.25      # rad/s for staging -> tilted release (largest joint 0.76 rad)
+HOPPER_EXIT = (-0.60, 0.0, HOVER_Z)   # tool-down pose the arm leaves the hopper to
 # Pre-pick hover: the move after it (to the ore) is the precise one.
 APPROACH_TOLERANCE = 0.01               # m
 HOPPER_HEADING = math.pi                # the hopper is straight behind the arm
@@ -204,18 +215,25 @@ def _ur_fk(q):
 
 
 def _ik_tool_down(point, seed):
-    """Joint angles putting the TCP at point with the tool straight down, or None.
+    """Joint angles putting the TCP at point with the tool straight down, or None."""
+    return _ik_tool_axis(point, (0.0, 0.0, -1.0), seed)
+
+
+def _ik_tool_axis(point, axis, seed):
+    """Joint angles putting the TCP at point with the tool axis along axis, or None.
 
     Damped least squares on joints 1-5 from the seed (so the solution keeps the
     seed's arm configuration); joint 6 only spins the tool about its axis and keeps
     the seed's value. Five residuals: TCP position (3) and the tool axis's x, y.
+    axis must point downwards (z < 0) and be a unit vector.
     """
     target = np.array(point, dtype=float)
+    ax, ay, az = axis
     q = np.array(seed, dtype=float)
 
     def residual(angles):
         t = _ur_fk(angles)
-        return np.r_[t[:3, 3] - target, t[0, 2], t[1, 2]]
+        return np.r_[t[:3, 3] - target, t[0, 2] - ax, t[1, 2] - ay]
 
     for _ in range(60):
         r = residual(q)
@@ -228,7 +246,8 @@ def _ik_tool_down(point, seed):
             jac[:, j] = (residual(q + dq) - r) / 1e-6
         q[:5] += np.linalg.solve(jac.T @ jac + 1e-4 * np.eye(5), -jac.T @ r)
     t = _ur_fk(q)
-    if (np.linalg.norm(t[:3, 3] - target) > 1e-4 or t[2, 2] > -0.999
+    if (np.linalg.norm(t[:3, 3] - target) > 1e-4
+            or t[0, 2] * ax + t[1, 2] * ay + t[2, 2] * az < 0.9995
             or np.any(np.abs(q) > 2.0 * math.pi - 0.1)
             or np.any(np.abs(q[1:5] - np.array(seed[1:5])) > 1.6)):
         return None
@@ -322,6 +341,7 @@ class Task2AManipulation(Node):
         self.sweep_joints = None
         self.sweep_next = None
         self.staging_joints = None      # joint angles recorded at HOPPER_STAGING
+        self.reach_joints = None        # tilted release pose over the hopper (batch 3)
         self.package_phase_after_switch = None
         self.timer = self.create_timer(0.05, self._step)
         self.get_logger().info(
@@ -795,11 +815,14 @@ class Task2AManipulation(Node):
         return min(candidates, key=lambda c: (
             abs(c - pan) + 0.01 * abs(c - PAN_PREFERRED)))
 
-    def _begin_joint_transfer(self, point, next_phase):
-        """One joint move to a tool-down point (via the sweep phases). False if IK fails."""
+    def _begin_joint_transfer(self, point, next_phase, axis=(0.0, 0.0, -1.0)):
+        """One joint move to a point with the tool along axis (via the sweep phases).
+
+        False if IK finds no solution.
+        """
         seed = [self._pan_for_heading(math.atan2(point[1], point[0]))]
         seed += list(self.joint_angles[1:])
-        q = _ik_tool_down(point, seed)
+        q = _ik_tool_axis(point, axis, seed)
         if q is None:
             self.get_logger().warning(
                 f'IK found no tool-down solution for ({point[0]:.3f}, {point[1]:.3f}, '
@@ -819,6 +842,7 @@ class Task2AManipulation(Node):
         self.package_find_started = self._now_seconds()
         self.package_looked_away = False
         self.tool_axis_target = (0.0, 0.0, -1.0)
+        self.staging_joints = None
         self.get_logger().info('Starting the package job.')
         self._change_phase('pkg_rise')
 
@@ -827,9 +851,10 @@ class Task2AManipulation(Node):
         now = self._now_seconds()
 
         if phase == 'pkg_rise':
-            # Straight up first, clear of the conveyor, the wells and the deck.
+            # Up to transfer height first, clear of the conveyor and the wells.
             p = self._position()
-            if self._move_toward(self._reach_safe((p[0], p[1], max(p[2], PACKAGE_CARRY_Z)))):
+            if self._move_toward(self._reach_safe((p[0], p[1], max(p[2], HOVER_Z))),
+                                 tolerance=VIA_TOLERANCE):
                 self._change_phase('pkg_find')
             return
 
@@ -855,7 +880,10 @@ class Task2AManipulation(Node):
                 self.package_target = point
                 self.get_logger().info(
                     f'Package top face at ({point[0]:.3f}, {point[1]:.3f}, '
-                    f'{point[2]:.3f}); turning towards it.')
+                    f'{point[2]:.3f}); moving above it.')
+                hover = self._reach_safe((point[0], point[1], point[2] + PACKAGE_HOVER))
+                if self._begin_joint_transfer(hover, 'pkg_above'):
+                    return
                 self._begin_sweep(math.atan2(point[1], point[0]), 'pkg_above')
                 return
             self._publish_twist((0.0, 0.0, 0.0))
@@ -880,7 +908,7 @@ class Task2AManipulation(Node):
             if point is not None:
                 self.package_target = point
             px, py, pz = self.package_target
-            if self._move_toward((px, py, PACKAGE_CARRY_Z)):
+            if self._move_toward((px, py, pz + PACKAGE_HOVER), tolerance=VIA_TOLERANCE):
                 self._change_phase('pkg_descend')
             return
 
@@ -954,7 +982,43 @@ class Task2AManipulation(Node):
                 self._publish_cleared()
             if self._move_toward((px, py, PACKAGE_CARRY_Z)):
                 self._publish_cleared()
+                # Same height and radius at both ends: this joint move is a pure
+                # base-joint swing, like the sweep, but ends exactly at staging.
+                if self._begin_joint_transfer(HOPPER_STAGING, 'pkg_reach'):
+                    return
                 self._begin_sweep(HOPPER_HEADING, 'pkg_staging')
+            return
+
+        if phase == 'pkg_reach':
+            # Staging -> tilted release pose in one slow joint move (offline: TCP goes
+            # out and down together, package bottom >= 0.26 over the rim at 0.207).
+            self._publish_twist((0.0, 0.0, 0.0))
+            tilt_axis = (-math.sin(HOPPER_TILT), 0.0, -math.cos(HOPPER_TILT))
+            q = _ik_tool_axis(HOPPER_DROP, tilt_axis, list(self.joint_angles))
+            if q is None:
+                self.get_logger().warning('IK found no tilted release pose; using the twist route.')
+                self._change_phase('pkg_staging')
+                return
+            self.reach_joints = q
+            self.tool_axis_target = tilt_axis
+            self._switch(JOINT_CONTROLLER, TWIST_CONTROLLER, 'pkg_reach_move')
+            return
+
+        if phase == 'pkg_reach_move':
+            warned = self.arm_status is not None and 10 <= self.arm_status <= 19
+            if warned:
+                self.get_logger().warning(
+                    f'Arm warning {self.arm_status} on the way to the hopper; releasing here.')
+            if warned or self._joint_move_toward(self.reach_joints,
+                                                 max_speed=PACKAGE_REACH_SPEED,
+                                                 tolerance=JOINT_TOLERANCE, gain=3.0):
+                self._publish_joints((0.0,) * 6)
+                self._switch(TWIST_CONTROLLER, JOINT_CONTROLLER, 'pkg_release')
+            return
+
+        if phase == 'pkg_release':
+            self._publish_twist((0.0, 0.0, 0.0))
+            self._call_magnet(False, 'pkg_wait_release')
             return
 
         if phase == 'pkg_staging':
@@ -999,6 +1063,12 @@ class Task2AManipulation(Node):
             force_fresh = (self.force_time is not None and now - self.force_time < 0.5)
             if force_fresh and self.force_n < FORCE_HELD_THRESHOLD_N:
                 self.get_logger().info('Package released over the crusher hopper.')
+                if self.staging_joints is None:
+                    # Joint-move route in: leave to a tool-down pose inside the rim.
+                    q = _ik_tool_down(HOPPER_EXIT, list(self.joint_angles))
+                    if q is None:
+                        q = [self.joint_angles[0]] + list(UNFOLD_POSE[1:])
+                    self.staging_joints = q
                 self._switch(JOINT_CONTROLLER, TWIST_CONTROLLER, 'pkg_exit')
                 return
             if now - self.phase_started > 1.5:
@@ -1009,7 +1079,8 @@ class Task2AManipulation(Node):
             # Leave the hopper in joint space. A straight Cartesian move back from
             # near full stretch is the direction the arm can barely produce
             # (the reach test latched 21 doing exactly that).
-            if self._joint_move_toward(self.staging_joints):
+            if self._joint_move_toward(self.staging_joints, max_speed=SWEEP_SPEED,
+                                       tolerance=SWEEP_TOLERANCE, gain=SWEEP_GAIN):
                 self.tool_axis_target = (0.0, 0.0, -1.0)
                 self.package_done = True
                 self.get_logger().info('Package job done.')
