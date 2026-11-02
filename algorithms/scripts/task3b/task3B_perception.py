@@ -55,6 +55,16 @@ TRACK_RETENTION_S = 1800.0
 PACKAGE_FRAME = 'ore_package'
 PACKAGE_HSV = (np.array([135, 80, 20]), np.array([165, 255, 255]))
 PACKAGE_MIN_AREA_PX = 60.0
+# Detection is scored within 0.05 m of the top-face centre. A partly hidden panel
+# (the arm above it) pulls the purple centroid towards the visible part, and the
+# package is 0.178 m long. The package does not move while the eBot is parked, so a
+# view smaller than this fraction of the best view so far re-publishes the best one.
+PACKAGE_FULL_VIEW = 0.85
+# Ore top faces measured by the arm itself (TCP z at magnet contact, every 3A/3B
+# pick: -0.0625 to -0.0628). 3B depth is noisy; the published height is kept within
+# 2 cm of that so a depth outlier cannot push a TF past the 0.05 m detection limit.
+ORE_TOP_Z = -0.063
+ORE_Z_BAND = 0.02
 # Where the deck of an eBot parked beside the arm can be, in base_link (m).
 # Measured 28 Oct: top face centre at (0.651, 0.091, 0.255).
 PACKAGE_ROI = ((0.25, 1.05), (-0.45, 0.45), (0.10, 0.45))
@@ -98,6 +108,7 @@ class OrePerception(Node):
         self.marker_areas = {}
         self.ebot_at_arm = False
         self.package_cleared = False
+        self.package_best = None        # (centre, yaw, area) of the fullest view so far
         self.package_logged = False
         self.package_miss_log_time = 0.0
 
@@ -341,7 +352,8 @@ class OrePerception(Node):
             msg.child_frame_id = f'{kind}_{track_id}'
             msg.transform.translation.x = float(point[0])
             msg.transform.translation.y = float(point[1])
-            msg.transform.translation.z = float(point[2])
+            msg.transform.translation.z = float(min(max(point[2], ORE_TOP_Z - ORE_Z_BAND),
+                                                    ORE_TOP_Z + ORE_Z_BAND))
             msg.transform.rotation.w = 1.0
             transforms.append(msg)
 
@@ -349,6 +361,15 @@ class OrePerception(Node):
         if self.ebot_at_arm and not self.package_cleared:
             found, purple_px = self._find_package(image)
             now = self.get_clock().now().nanoseconds / 1e9
+            if found is not None:
+                best = self.package_best
+                if best is None or found[2] >= PACKAGE_FULL_VIEW * best[2]:
+                    if best is None or found[2] >= best[2]:
+                        self.package_best = found
+                else:
+                    found = best      # partial view: keep the full-view estimate
+            elif self.package_best is not None:
+                found = self.package_best
             if found is not None:
                 centre, yaw, area = found
                 msg = TransformStamped()
